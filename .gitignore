@@ -1,0 +1,5 @@
+build/
+release-notes.md
+*.log
+input-mouser.ini
+input-mouser.ini.tmp
