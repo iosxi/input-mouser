@@ -202,6 +202,89 @@ void net_reconnect_now(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  探索の呼びかけ(UDP のブロードキャスト)                              */
+/* ------------------------------------------------------------------ */
+
+static SOCKET disc_socket(void)
+{
+    BOOL   on = TRUE;
+    struct sockaddr_in me;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return s;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof(on));
+    ZeroMemory(&me, sizeof(me));
+    me.sin_family = AF_INET;
+    bind(s, (struct sockaddr *)&me, sizeof(me));
+    return s;
+}
+
+static void disc_send_to(SOCKET s, ULONG addr, int port)
+{
+    struct sockaddr_in to;
+    BYTE q[6];
+    CopyMemory(q, "IMSR?", 5);
+    q[5] = PROTO_VER;
+    ZeroMemory(&to, sizeof(to));
+    to.sin_family      = AF_INET;
+    to.sin_port        = htons((u_short)port);
+    to.sin_addr.s_addr = addr;
+    sendto(s, (const char *)q, sizeof(q), 0, (struct sockaddr *)&to, sizeof(to));
+}
+
+/* 255.255.255.255 は 1 つの経路にしか出ないことがあるので、
+   つながっているネットワークごとの宛先(192.168.0.255 など)にも送る */
+static void disc_broadcast(SOCKET s, const int *ports, int np)
+{
+    ULONG size = 16384;
+    IP_ADAPTER_ADDRESSES *aa = NULL, *a;
+    int   i;
+
+    for (i = 0; i < np; i++) {
+        disc_send_to(s, INADDR_BROADCAST, ports[i]);
+        if (g_bindAddr[0]) disc_send_to(s, htonl(INADDR_LOOPBACK), ports[i]);    /* 検証用 */
+    }
+    aa = (IP_ADAPTER_ADDRESSES *)mem_alloc(size);
+    if (aa && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                            GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) == ERROR_BUFFER_OVERFLOW) {
+        mem_free(aa);
+        aa = (IP_ADAPTER_ADDRESSES *)mem_alloc(size);
+        if (aa && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                                GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) != NO_ERROR) {
+            mem_free(aa);
+            aa = NULL;
+        }
+    }
+    for (a = aa; a; a = a->Next) {
+        IP_ADAPTER_UNICAST_ADDRESS *u;
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (u = a->FirstUnicastAddress; u; u = u->Next) {
+            ULONG ip, mask;
+            int   pl = u->OnLinkPrefixLength;
+            if (u->Address.lpSockaddr->sa_family != AF_INET || pl <= 0 || pl >= 31) continue;
+            ip   = ntohl(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr);
+            mask = 0xFFFFFFFFu << (32 - pl);
+            for (i = 0; i < np; i++) disc_send_to(s, htonl(ip | ~mask), ports[i]);
+        }
+    }
+    mem_free(aa);
+}
+
+/* 返事の名前と、登録した名前が同じ PC を指すか(大文字小文字と、
+   「.local」などドメインの付け外しは区別しない) */
+static BOOL same_host(const WCHAR *host, const WCHAR *name)
+{
+    WCHAR a[HOST_MAX], b[HOST_MAX], *p;
+    if (!lstrcmpiW(host, name)) return TRUE;
+    lstrcpynW(a, host, HOST_MAX);
+    lstrcpynW(b, name, HOST_MAX);
+    for (p = a; *p && *p != L'.'; p++) ;
+    *p = 0;
+    for (p = b; *p && *p != L'.'; p++) ;
+    *p = 0;
+    return a[0] && !lstrcmpiW(a, b);
+}
+
+/* ------------------------------------------------------------------ */
 /*  接続スレッド(こちらがマスター。相手ごとに 1 本)                    */
 /* ------------------------------------------------------------------ */
 
@@ -216,6 +299,7 @@ typedef struct {
 } Connector;
 
 static Connector *g_connectors[PEER_MAX];
+static void read_name(const BYTE *p, int avail, WCHAR *out);
 static LONG       g_gen[PEER_MAX];
 
 static void connector_release(Connector *c)
@@ -226,46 +310,107 @@ static void connector_release(Connector *c)
     }
 }
 
-/* つながるまで最大 3 秒待つ。やめる指示があれば早めに戻る */
+/* 1 つの宛先へ。つながるまで最大 3 秒待つ。やめる指示があれば早めに戻る */
+static SOCKET try_connect(Connector *c, const struct sockaddr *sa, int salen)
+{
+    u_long nb = 1;
+    int    i, err = 0, elen = sizeof(err);
+    SOCKET s = socket(sa->sa_family, SOCK_STREAM, IPPROTO_TCP);
+
+    if (s == INVALID_SOCKET) return s;
+    ioctlsocket(s, FIONBIO, &nb);
+    if (connect(s, sa, salen) == 0) return s;
+    if (WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); return INVALID_SOCKET; }
+    for (i = 0; i < 12 && !c->stop; i++) {          /* 250ms × 12 */
+        fd_set w, e;
+        struct timeval tv = { 0, 250000 };
+        FD_ZERO(&w); FD_ZERO(&e);
+        FD_SET(s, &w); FD_SET(s, &e);
+        if (select(0, NULL, &w, &e, &tv) > 0) break;
+    }
+    if (!c->stop && getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) == 0 && err == 0) {
+        fd_set w;
+        struct timeval tv = { 0, 0 };
+        FD_ZERO(&w); FD_SET(s, &w);
+        if (select(0, NULL, &w, NULL, &tv) > 0) return s;
+    }
+    closesocket(s);
+    return INVALID_SOCKET;
+}
+
+/* input-mouser 自身の PC 探索で、登録した名前・ポートの PC を探す。
+   Windows の名前解決(ルーターの DNS、LLMNR、NetBIOS)に頼らない。
+   ルーターが名前を知らず、相手のネットワークが「パブリック」で名前の
+   問い合わせに答えないときでも、探索に答える PC なら見つかる。 */
+static BOOL find_by_name(Connector *c, struct sockaddr_in *out)
+{
+    SOCKET s = disc_socket();
+    DWORD  until = GetTickCount() + 1000;
+    BOOL   found = FALSE;
+
+    if (s == INVALID_SOCKET) return FALSE;
+    disc_broadcast(s, &c->port, 1);
+    while (!found && !c->stop && (LONG)(until - GetTickCount()) > 0) {
+        BYTE   buf[600];
+        WCHAR  name[HOST_MAX];
+        struct sockaddr_in from;
+        int    fl = sizeof(from), n;
+        fd_set r;
+        struct timeval tv = { 0, 100000 };
+
+        FD_ZERO(&r); FD_SET(s, &r);
+        if (select(0, &r, NULL, NULL, &tv) <= 0) continue;
+        n = recvfrom(s, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
+        if (n < 9 || memcmp(buf, "IMSR!", 5) || from.sin_family != AF_INET) continue;
+        if (le16(buf + 6) != c->port) continue;
+        read_name(buf + 8, n - 8, name);
+        if (!same_host(c->host, name)) continue;
+        *out = from;
+        out->sin_port = htons((u_short)c->port);
+        found = TRUE;
+    }
+    closesocket(s);
+    return found;
+}
+
+static BOOL is_ip_literal(const WCHAR *host)
+{
+    BYTE b[16];
+    return InetPtonW(AF_INET, host, b) == 1 || InetPtonW(AF_INET6, host, b) == 1;
+}
+
 static SOCKET connect_host(Connector *c)
 {
     ADDRINFOW  hints, *res = NULL, *ai;
     WCHAR      port[8];
     SOCKET     s = INVALID_SOCKET;
+    BOOL       resolved;
 
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     wsprintfW(port, L"%d", c->port);
-    if (GetAddrInfoW(c->host, port, &hints, &res) != 0) return INVALID_SOCKET;
-
-    for (ai = res; ai && !c->stop; ai = ai->ai_next) {
-        u_long nb = 1;
-        int    i, err = 0, elen = sizeof(err);
-
-        s = socket(ai->ai_family, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) continue;
-        ioctlsocket(s, FIONBIO, &nb);
-        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
-        if (WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); s = INVALID_SOCKET; continue; }
-        for (i = 0; i < 12 && !c->stop; i++) {          /* 250ms × 12 */
-            fd_set w, e;
-            struct timeval tv = { 0, 250000 };
-            FD_ZERO(&w); FD_ZERO(&e);
-            FD_SET(s, &w); FD_SET(s, &e);
-            if (select(0, NULL, &w, &e, &tv) > 0) break;
-        }
-        if (!c->stop && getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &elen) == 0 && err == 0) {
-            fd_set w;
-            struct timeval tv = { 0, 0 };
-            FD_ZERO(&w); FD_SET(s, &w);
-            if (select(0, NULL, &w, NULL, &tv) > 0) break;
-        }
-        closesocket(s);
-        s = INVALID_SOCKET;
+    resolved = GetAddrInfoW(c->host, port, &hints, &res) == 0;
+    if (resolved) {
+        for (ai = res; ai && !c->stop && s == INVALID_SOCKET; ai = ai->ai_next)
+            s = try_connect(c, ai->ai_addr, (int)ai->ai_addrlen);
+        FreeAddrInfoW(res);
     }
-    FreeAddrInfoW(res);
+
+    /* 名前が引けない、または引けた IP にいない(IP が変わった)とき */
+    if (s == INVALID_SOCKET && !c->stop && !is_ip_literal(c->host)) {
+        struct sockaddr_in a;
+        if (find_by_name(c, &a)) {
+            WCHAR ip[64];
+            addr_text((struct sockaddr *)&a, ip, 64);
+            s = try_connect(c, (struct sockaddr *)&a, sizeof(a));
+            if (s != INVALID_SOCKET)
+                log_printf(resolved ? L"%s は名前で引いた IP にいなかったので、PC 探索で見つけた %s につなぎました"
+                                    : L"%s の名前を引けなかったので、PC 探索で見つけた %s につなぎました",
+                           c->host, ip);
+        }
+    }
     return s;
 }
 
@@ -781,36 +926,15 @@ static void on_udp(void)
     }
 }
 
-static void disc_send_to(ULONG addr, int port)
-{
-    struct sockaddr_in to;
-    BYTE q[6];
-    CopyMemory(q, "IMSR?", 5);
-    q[5] = PROTO_VER;
-    ZeroMemory(&to, sizeof(to));
-    to.sin_family      = AF_INET;
-    to.sin_port        = htons((u_short)port);
-    to.sin_addr.s_addr = addr;
-    sendto(g_disc, (const char *)q, sizeof(q), 0, (struct sockaddr *)&to, sizeof(to));
-}
-
 static void start_discover(HWND notify)
 {
-    ULONG  size = 16384;
-    IP_ADAPTER_ADDRESSES *aa = NULL, *a;
-    int    ports[2 + PEER_MAX], np = 0, i, j;
+    int ports[2 + PEER_MAX], np = 0, i, j;
 
     g_discHwnd  = notify;
     g_discUntil = GetTickCount() + DISC_MS;
     if (g_disc == INVALID_SOCKET) {
-        BOOL on = TRUE;
-        struct sockaddr_in me;
-        g_disc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        g_disc = disc_socket();
         if (g_disc == INVALID_SOCKET) return;
-        setsockopt(g_disc, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof(on));
-        ZeroMemory(&me, sizeof(me));
-        me.sin_family = AF_INET;
-        bind(g_disc, (struct sockaddr *)&me, sizeof(me));
         WSAEventSelect(g_disc, g_discEv, FD_READ);
     }
     ports[np++] = g_nc.port;
@@ -819,38 +943,7 @@ static void start_discover(HWND notify)
         for (j = 0; j < np && ports[j] != g_nc.peers[i].port; j++) ;
         if (j == np) ports[np++] = g_nc.peers[i].port;
     }
-
-    for (i = 0; i < np; i++) {
-        disc_send_to(INADDR_BROADCAST, ports[i]);
-        if (g_bindAddr[0]) disc_send_to(htonl(INADDR_LOOPBACK), ports[i]);    /* 検証用 */
-    }
-
-    /* 255.255.255.255 は 1 つの経路にしか出ないことがあるので、
-       つながっているネットワークごとにも送る */
-    aa = (IP_ADAPTER_ADDRESSES *)mem_alloc(size);
-    if (aa && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                                            GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) == ERROR_BUFFER_OVERFLOW) {
-        mem_free(aa);
-        aa = (IP_ADAPTER_ADDRESSES *)mem_alloc(size);
-        if (aa && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
-                                                GAA_FLAG_SKIP_DNS_SERVER, NULL, aa, &size) != NO_ERROR) {
-            mem_free(aa);
-            aa = NULL;
-        }
-    }
-    for (a = aa; a; a = a->Next) {
-        IP_ADAPTER_UNICAST_ADDRESS *u;
-        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        for (u = a->FirstUnicastAddress; u; u = u->Next) {
-            ULONG ip, mask;
-            int   pl = u->OnLinkPrefixLength;
-            if (u->Address.lpSockaddr->sa_family != AF_INET || pl <= 0 || pl >= 31) continue;
-            ip   = ntohl(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr);
-            mask = 0xFFFFFFFFu << (32 - pl);
-            for (i = 0; i < np; i++) disc_send_to(htonl(ip | ~mask), ports[i]);
-        }
-    }
-    mem_free(aa);
+    disc_broadcast(g_disc, ports, np);
 }
 
 static void on_disc(void)

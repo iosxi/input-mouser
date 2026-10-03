@@ -3,7 +3,8 @@
  *
  *  相手の画面を開くと、同じネットワークで「操作を受け付けている」
  *  input-mouser を探して一覧に出す(UDP のブロードキャスト。net.c)。
- *  一覧から選ぶと名前とポートが入る。
+ *  一覧から選ぶと、名前か IP アドレス(下の切り替えで選ぶ)とポートが入る。
+ *  名前で登録すれば、IP が変わっても探索で追いかけられる(net.c の find_by_name)。
  * ================================================================== */
 
 #include "mouser.h"
@@ -13,10 +14,13 @@ extern HWND g_modal;
 
 static const int k_peerHeadings[] = { IDC_H_PEER, IDC_H_FOUND };
 
+#define FOUND_MAX 64
+
 typedef struct {
     Peer   *p;
     DlgLook look;
     int     found;
+    Found   items[FOUND_MAX];   /* 一覧の各行(lParam が添え字) */
 } PeerDlg;
 
 static INT_PTR common_msg(HWND h, UINT msg, WPARAM wp, LPARAM lp, DlgLook *lk, BOOL *handled)
@@ -71,40 +75,35 @@ static void add_found(HWND h, PeerDlg *d, const Found *f)
 
     /* 自分自身(同じ名前・同じポートで受け付けている)は出さない */
     if (!lstrcmpiW(f->name, g_hostName) && f->port == g_cfg.port && g_cfg.accept && !g_bindAddr[0]) return;
-    for (i = 0; i < n; i++) {           /* 複数の経路から同じ返事が届く */
-        WCHAR nm[HOST_MAX];
-        ZeroMemory(&it, sizeof(it));
-        it.mask = LVIF_PARAM;
-        it.iItem = i;
-        ListView_GetItem(lv, &it);
-        ListView_GetItemText(lv, i, 0, nm, HOST_MAX);
-        if (!lstrcmpiW(nm, f->name) && (int)it.lParam == f->port) return;
-    }
+    for (i = 0; i < d->found; i++)      /* 複数の経路から同じ返事が届く */
+        if (!lstrcmpiW(d->items[i].name, f->name) && d->items[i].port == f->port) return;
+    if (d->found >= FOUND_MAX) return;
+    d->items[d->found] = *f;
     if (f->port == DEFAULT_PORT) lstrcpynW(addr, f->addr, ARRAYSIZE(addr));
     else wsprintfW(addr, L"%s : %d", f->addr, f->port);
     ZeroMemory(&it, sizeof(it));
     it.mask    = LVIF_TEXT | LVIF_PARAM;
     it.iItem   = n;
     it.pszText = (WCHAR *)f->name;
-    it.lParam  = f->port;
+    it.lParam  = d->found;
     ListView_InsertItem(lv, &it);
     ListView_SetItemText(lv, n, 1, addr);
     d->found++;
 }
 
-static void pick_found(HWND h, int i)
+/* 一覧の i 行目を登録欄へ。名前か IP かは切り替えに従う */
+static void pick_found(HWND h, PeerDlg *d, int i)
 {
-    HWND    lv = GetDlgItem(h, IDC_FOUND);
-    WCHAR   nm[HOST_MAX];
-    LVITEMW it;
+    LVITEMW      it;
+    const Found *f;
     if (i < 0) return;
     ZeroMemory(&it, sizeof(it));
-    it.mask = LVIF_PARAM;
+    it.mask  = LVIF_PARAM;
     it.iItem = i;
-    ListView_GetItem(lv, &it);
-    ListView_GetItemText(lv, i, 0, nm, HOST_MAX);
-    SetDlgItemTextW(h, IDC_HOST, nm);
-    SetDlgItemInt(h, IDC_PPORT, (UINT)it.lParam, FALSE);
+    if (!ListView_GetItem(GetDlgItem(h, IDC_FOUND), &it) || it.lParam < 0 || it.lParam >= d->found) return;
+    f = &d->items[it.lParam];
+    SetDlgItemTextW(h, IDC_HOST, IsDlgButtonChecked(h, IDC_USE_IP) == BST_CHECKED ? f->addr : f->name);
+    SetDlgItemInt(h, IDC_PPORT, (UINT)f->port, FALSE);
 }
 
 static INT_PTR CALLBACK peer_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -130,6 +129,7 @@ static INT_PTR CALLBACK peer_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetDlgItemInt(h, IDC_PPORT, (UINT)d->p->port, FALSE);
         SendDlgItemMessageW(h, IDC_HOST, EM_SETCUEBANNER, TRUE, (LPARAM)L"例: OFFICE-PC、192.168.1.20");
         hotkey_edit_attach(GetDlgItem(h, IDC_PHK), &d->p->hk);
+        CheckRadioButton(h, IDC_USE_NAME, IDC_USE_IP, IDC_USE_NAME);
 
         ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         GetClientRect(lv, &rc);
@@ -162,9 +162,9 @@ static INT_PTR CALLBACK peer_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         if (n->idFrom != IDC_FOUND) break;
         if (n->code == LVN_ITEMCHANGED) {
             NMLISTVIEW *v = (NMLISTVIEW *)lp;
-            if ((v->uChanged & LVIF_STATE) && (v->uNewState & LVIS_SELECTED)) pick_found(h, v->iItem);
+            if ((v->uChanged & LVIF_STATE) && (v->uNewState & LVIS_SELECTED)) pick_found(h, d, v->iItem);
         } else if (n->code == NM_DBLCLK && ((NMITEMACTIVATE *)lp)->iItem >= 0) {
-            pick_found(h, ((NMITEMACTIVATE *)lp)->iItem);
+            pick_found(h, d, ((NMITEMACTIVATE *)lp)->iItem);
             PostMessageW(h, WM_COMMAND, IDOK, 0);
         }
         break;
@@ -174,6 +174,11 @@ static INT_PTR CALLBACK peer_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDC_FIND:
             start_find(h, d);
+            return TRUE;
+        case IDC_USE_NAME:
+        case IDC_USE_IP:            /* 選んである行を、切り替えた方で入れ直す */
+            if (HIWORD(wp) == BN_CLICKED)
+                pick_found(h, d, ListView_GetNextItem(GetDlgItem(h, IDC_FOUND), -1, LVNI_SELECTED));
             return TRUE;
         case IDOK: {
             WCHAR host[HOST_MAX];

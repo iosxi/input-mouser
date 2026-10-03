@@ -15,6 +15,7 @@
  *  input-mouser.exe -bind <addr>    受け付けるアドレスを絞る(127.0.0.1 など)
  *  input-mouser.exe -dryrun         受けた入力を再現せず、ログに書くだけにする
  *  input-mouser.exe -nohook         フックを掛けない(画面の確認で、切り替わらないように)
+ *  input-mouser.exe -name <名前>    この名前で名乗る(名前で引けない相手への接続を確かめる)
  *
  *  多重起動の判定は設定ファイルごと。-ini で別の設定を指定すれば
  *  並べて動かせる(検証用)。
@@ -364,6 +365,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     BOOL    openSettings = FALSE, first, noHook = FALSE;
     INITCOMMONCONTROLSEX icc;
     DWORD   n, waitPid = 0;
+    WCHAR   fakeName[HOST_MAX] = L"";
 
     (void)prev; (void)cmdline; (void)show;
     g_inst = inst;
@@ -383,6 +385,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"settings")) openSettings = TRUE;
         else if (!lstrcmpiW(a, L"dryrun"))   g_dryRun = TRUE;
         else if (!lstrcmpiW(a, L"nohook"))   noHook = TRUE;
+        else if (!lstrcmpiW(a, L"name") && i + 1 < argc) lstrcpynW(fakeName, argv[++i], HOST_MAX);
         else if (!lstrcmpiW(a, L"wait") && i + 1 < argc) waitPid = (DWORD)StrToIntW(argv[++i]);
         else if (!lstrcmpiW(a, L"bind") && i + 1 < argc) lstrcpynW(g_bindAddr, argv[++i], 64);
         else if (!lstrcmpiW(a, L"switch") && i + 1 < argc) {
@@ -428,6 +431,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         n = HOST_MAX;
         GetComputerNameW(g_hostName, &n);
     }
+    if (fakeName[0]) lstrcpynW(g_hostName, fakeName, HOST_MAX);
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     icc.dwSize = sizeof(icc);

@@ -43,6 +43,8 @@
 #define IDC_PHK            1106
 #define IDC_HINT_PHK       1107
 #define IDC_H_PEER         1108
+#define IDC_USE_NAME       1109
+#define IDC_USE_IP         1110
 
 /* パスワード */
 #define IDC_PW_HINT        1200

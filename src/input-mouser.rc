@@ -64,7 +64,7 @@ END
 // ------------------------------------------------------------------
 //  相手の PC
 // ------------------------------------------------------------------
-IDD_PEER DIALOGEX 0, 0, 260, 228
+IDD_PEER DIALOGEX 0, 0, 260, 240
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "操作する PC"
 FONT 9, "Yu Gothic UI", 400, 0, 0x80
@@ -77,14 +77,16 @@ BEGIN
     LTEXT           "同じネットワークで見つかった PC", IDC_H_FOUND, 12, 58, 236, 11
     CONTROL         "", IDC_FOUND, "SysListView32",
                     LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP,
-                    12, 72, 236, 72
-    PUSHBUTTON      "もう一度探す(&F)", IDC_FIND, 12, 148, 70, 15
-    LTEXT           "", IDC_FIND_STATE, 88, 151, 160, 9, SS_NOPREFIX
-    LTEXT           "ホットキー(&K)", -1, 12, 172, 60, 9
-    EDITTEXT        IDC_PHK, 74, 170, 100, 14, ES_AUTOHSCROLL
-    LTEXT           "押すと、この PC へ直接切り替えます。", IDC_HINT_PHK, 74, 187, 174, 9
-    DEFPUSHBUTTON   "OK", IDOK, 136, 206, 54, 15
-    PUSHBUTTON      "キャンセル", IDCANCEL, 194, 206, 54, 15
+                    12, 72, 236, 66
+    AUTORADIOBUTTON "PC の名前で登録(&M)", IDC_USE_NAME, 12, 143, 100, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "IP アドレスで登録(&I)", IDC_USE_IP, 118, 143, 120, 10
+    PUSHBUTTON      "もう一度探す(&F)", IDC_FIND, 12, 160, 70, 15
+    LTEXT           "", IDC_FIND_STATE, 88, 163, 160, 9, SS_NOPREFIX
+    LTEXT           "ホットキー(&K)", -1, 12, 184, 60, 9
+    EDITTEXT        IDC_PHK, 74, 182, 100, 14, ES_AUTOHSCROLL
+    LTEXT           "押すと、この PC へ直接切り替えます。", IDC_HINT_PHK, 74, 199, 174, 9
+    DEFPUSHBUTTON   "OK", IDOK, 136, 218, 54, 15
+    PUSHBUTTON      "キャンセル", IDCANCEL, 194, 218, 54, 15
 END
 
 // ------------------------------------------------------------------
@@ -107,8 +109,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION 1,2,0,0
+ PRODUCTVERSION 1,2,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -118,9 +120,9 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "nekoryu"
             VALUE "FileDescription", "input-mouser - 1 組のキーボードとマウスで複数の PC を操作"
-            VALUE "FileVersion", "1.1.0"
+            VALUE "FileVersion", "1.2.0"
             VALUE "ProductName", "input-mouser"
-            VALUE "ProductVersion", "1.1.0"
+            VALUE "ProductVersion", "1.2.0"
             VALUE "Comments", "画面の端を越えると、LAN でつながった隣の PC を操作できます"
             VALUE "OriginalFilename", "input-mouser.exe"
         END
