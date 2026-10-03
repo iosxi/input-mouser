@@ -11,9 +11,12 @@
 - リリースの添付物: **`input-mouser.exe`**。改名せず、そのまま `gh release create` に渡す
   （単体で置いて使うものなので、版ごとに名前が変わると更新のたびに旧版が残る。
   sleep-guard / ramday / kotemado と同じ方針）。
-- バージョン: タグの `vN` とは別に、`src/input-mouser.rc` の VERSIONINFO、
-  `src/input-mouser.manifest` の `assemblyIdentity`、`src/mouser.h` の `APP_VERSION` がある。
-  機能が変わったら 3 か所とも上げる。
+- **バージョンはタグの `vN` と同じ番号にそろえる**（利用者の指示、2026-10-03。v4 から）。
+  リリースのたびに 3 か所を `N` にする:
+  - `src/mouser.h` の `APP_VERSION` … `L"vN"`（設定画面のキャプション「input-mouser vN」とログに出る）
+  - `src/input-mouser.rc` の VERSIONINFO … 数値は `N,0,0,0`、文字列の FileVersion / ProductVersion は `"vN"`
+  - `src/input-mouser.manifest` の `assemblyIdentity` … `N.0.0.0`（数字 4 つしか書けない）
+  v1〜v3 は 1.0.0 / 1.1.0 / 1.2.0 と付けていた。
 - **通信の形を変えたら `net.c` の `PROTO_VER` を上げる。** 版の違う相手とは「版が合いません」で
   つながらなくなる（どの PC も同じ版にそろえてもらう前提）。
 
