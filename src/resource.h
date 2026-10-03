@@ -28,9 +28,10 @@
 #define IDC_HK_HOME        1025
 #define IDC_HK_LOCK        1026
 #define IDC_H_GENERAL      1030
-#define IDC_STARTUP        1031
+#define IDC_ADMIN          1031
 #define IDC_INIPATH        1032
 #define IDC_HINT_SWITCH    1033
+#define IDC_HINT_ADMIN     1034
 
 /* 相手の PC */
 #define IDC_HOST           1100

@@ -207,6 +207,7 @@ static void set_general(Config *c, const WCHAR *k, const WCHAR *v)
     else if (!lstrcmpiW(k, L"hotkey_home")) hotkey_parse(v, &c->hkHome);
     else if (!lstrcmpiW(k, L"hotkey_lock")) hotkey_parse(v, &c->hkLock);
     else if (!lstrcmpiW(k, L"osd"))        c->osd = (v[0] == L'1');
+    else if (!lstrcmpiW(k, L"admin"))      c->admin = (v[0] == L'1');
     else if (!lstrcmpiW(k, L"log"))        c->log = (v[0] == L'1');
     else if (!lstrcmpiW(k, L"theme"))
         c->theme = !lstrcmpiW(v, L"light") ? 1 : !lstrcmpiW(v, L"dark") ? 2 : 0;
@@ -365,6 +366,7 @@ BOOL config_save(void)
     sb_hk(&b, L"hotkey_home", &g_cfg.hkHome);
     sb_hk(&b, L"hotkey_lock", &g_cfg.hkLock);
     sb_kv(&b, L"osd", g_cfg.osd ? L"1" : L"0");
+    sb_kv(&b, L"admin", g_cfg.admin ? L"1" : L"0");
     if (g_cfg.theme) sb_kv(&b, L"theme", g_cfg.theme == 1 ? L"light" : L"dark");
     if (g_logInIni)  sb_kv(&b, L"log", L"1");
 

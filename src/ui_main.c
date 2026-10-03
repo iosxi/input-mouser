@@ -55,7 +55,7 @@ static void fill(void)
     SetDlgItemInt(g_main, IDC_CORNER, (UINT)g_cfg.corner, FALSE);
     CheckDlgButton(g_main, IDC_NODRAG,  g_cfg.noDragSwitch ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_main, IDC_CLIP,    g_cfg.clipboard ? BST_CHECKED : BST_UNCHECKED);
-    CheckDlgButton(g_main, IDC_STARTUP, startup_enabled() ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(g_main, IDC_ADMIN,   g_cfg.admin ? BST_CHECKED : BST_UNCHECKED);
     hotkey_edit_attach(GetDlgItem(g_main, IDC_HK_HOME), &g_cfg.hkHome);
     hotkey_edit_attach(GetDlgItem(g_main, IDC_HK_LOCK), &g_cfg.hkLock);
     wsprintfW(t, L"設定ファイル: %s", g_iniPath);
@@ -163,7 +163,7 @@ static INT_PTR CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_INITDIALOG: {
         WCHAR t[64];
         g_main = h;
-        wsprintfW(t, L"%s %s", APP_NAME, APP_VERSION);
+        wsprintfW(t, L"%s %s%s", APP_NAME, APP_VERSION, g_elevated ? L"（管理者）" : L"");
         SetWindowTextW(h, t);
         ui_set_icons(h);
         dlg_look_init(h, &g_look, k_headings, ARRAYSIZE(k_headings), IDCANCEL);
@@ -194,7 +194,7 @@ static INT_PTR CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         int id = GetDlgCtrlID((HWND)lp);
         return (INT_PTR)theme_ctlcolor(msg, (HDC)wp, (HWND)lp,
                                        id == IDC_HINT_LAYOUT || id == IDC_THIS_INFO ||
-                                       id == IDC_INIPATH || id == IDC_HINT_SWITCH);
+                                       id == IDC_INIPATH || id == IDC_HINT_SWITCH || id == IDC_HINT_ADMIN);
     }
 
     case WM_NOTIFY: {
@@ -251,11 +251,24 @@ static INT_PTR CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             g_cfg.clipboard = IsDlgButtonChecked(h, IDC_CLIP) == BST_CHECKED;
             config_changed();
             return TRUE;
-        case IDC_STARTUP: {
-            BOOL on = IsDlgButtonChecked(h, IDC_STARTUP) == BST_CHECKED;
-            if (!startup_set(on)) {
-                ui_message(h, L"スタートアップの設定を変更できませんでした。", NULL, 0, TD_ERROR_ICON);
-                CheckDlgButton(h, IDC_STARTUP, startup_enabled() ? BST_CHECKED : BST_UNCHECKED);
+        case IDC_ADMIN: {
+            BOOL on = IsDlgButtonChecked(h, IDC_ADMIN) == BST_CHECKED;
+            commit_all();
+            g_cfg.admin = on;
+            config_save();
+            if (on && !g_elevated) {
+                /* 管理者で起動し直す。新しい方がこちらの終わりを待ってから設定画面を出す */
+                if (app_relaunch_elevated(L"-settings")) {
+                    PostMessageW(g_trayWnd, WM_APP_COMMAND, CMD_EXIT, 0);
+                } else {
+                    g_cfg.admin = FALSE;
+                    config_save();
+                    CheckDlgButton(h, IDC_ADMIN, BST_UNCHECKED);
+                    ui_message(h, L"管理者として起動できませんでした。", NULL, 0, TD_ERROR_ICON);
+                }
+            } else if (!on && g_elevated) {
+                ui_message(h, L"いまは管理者のまま動いています。",
+                           L"input-mouser を終了して起動し直すと、普通の権限で動きます。", 0, TD_INFORMATION_ICON);
             }
             return TRUE;
         }

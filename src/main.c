@@ -8,6 +8,8 @@
  *  input-mouser.exe -exit           動いている input-mouser を終わらせる
  *  input-mouser.exe -ini <path>     設定ファイルを指定する(既定は exe と同じ場所)
  *  input-mouser.exe -log            動作を <設定ファイル名>.log に書く
+ *  input-mouser.exe -wait <pid>     その PID が終わるのを待ってから始める
+ *                                   (管理者として起動し直すときに自分で付ける)
  *
  *  検証用
  *  input-mouser.exe -bind <addr>    受け付けるアドレスを絞る(127.0.0.1 など)
@@ -32,9 +34,9 @@ HWND      g_trayWnd;
 WCHAR     g_hostName[HOST_MAX];
 WCHAR     g_bindAddr[64];
 BOOL      g_dryRun;
+BOOL      g_elevated;
 
 static WCHAR           g_logPath[MAX_PATH];
-static WCHAR           g_extraArgs[128];   /* スタートアップに引き継ぐ検証用の引数 */
 static SRWLOCK         g_logLock = SRWLOCK_INIT;
 static NOTIFYICONDATAW g_nid;
 static UINT            g_wmTaskbarCreated;
@@ -77,54 +79,42 @@ void log_printf(const WCHAR *fmt, ...)
 }
 
 /* ------------------------------------------------------------------ */
-/*  スタートアップ(スタートアップ フォルダのショートカット)            */
+/*  管理者として動かす                                                  */
 /* ------------------------------------------------------------------ */
 
-static BOOL startup_link(WCHAR *out)
+static BOOL is_elevated(void)
 {
-    PWSTR p = NULL;
-    if (FAILED(SHGetKnownFolderPath(&FOLDERID_Startup, 0, NULL, &p))) return FALSE;
-    wsprintfW(out, L"%s\\input-mouser.lnk", p);
-    CoTaskMemFree(p);
-    return TRUE;
-}
-
-BOOL startup_enabled(void)
-{
-    WCHAR lnk[MAX_PATH + 32];
-    return startup_link(lnk) && GetFileAttributesW(lnk) != INVALID_FILE_ATTRIBUTES;
-}
-
-BOOL startup_set(BOOL on)
-{
-    WCHAR         lnk[MAX_PATH + 32], dir[MAX_PATH], args[MAX_PATH + 160];
-    IShellLinkW  *sl = NULL;
-    IPersistFile *pf = NULL;
-    HRESULT       hr;
-    WCHAR        *s;
-
-    if (!startup_link(lnk)) return FALSE;
-    if (!on) return DeleteFileW(lnk) || GetLastError() == ERROR_FILE_NOT_FOUND;
-
-    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&sl);
-    if (FAILED(hr)) return FALSE;
-    lstrcpynW(dir, g_exePath, MAX_PATH);
-    for (s = dir + lstrlenW(dir); s > dir && s[-1] != L'\\'; s--) ;
-    if (s > dir) s[-1] = 0;
-    sl->lpVtbl->SetPath(sl, g_exePath);
-    sl->lpVtbl->SetWorkingDirectory(sl, dir);
-    sl->lpVtbl->SetDescription(sl, L"input-mouser - 1 組のキーボードとマウスで複数の PC を操作");
-    args[0] = 0;
-    if (g_customIni) wsprintfW(args, L"-ini \"%s\"", g_iniPath);
-    if (g_extraArgs[0]) { if (args[0]) lstrcatW(args, L" "); lstrcatW(args, g_extraArgs); }
-    if (args[0]) sl->lpVtbl->SetArguments(sl, args);
-    hr = sl->lpVtbl->QueryInterface(sl, &IID_IPersistFile, (void **)&pf);
-    if (SUCCEEDED(hr)) {
-        hr = pf->lpVtbl->Save(pf, lnk, TRUE);
-        pf->lpVtbl->Release(pf);
+    HANDLE          t;
+    TOKEN_ELEVATION e;
+    DWORD           n;
+    BOOL            r = FALSE;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) {
+        if (GetTokenInformation(t, TokenElevation, &e, sizeof(e), &n)) r = e.TokenIsElevated != 0;
+        CloseHandle(t);
     }
-    sl->lpVtbl->Release(sl);
-    return SUCCEEDED(hr);
+    return r;
+}
+
+/* 同じ引数に「-wait <自分>」を足して管理者で起動する。新しい方は、
+   こちらが終わるのを待ってから始める(多重起動の判定とポートが空くのを待つ)。 */
+BOOL app_relaunch_elevated(const WCHAR *extra)
+{
+    WCHAR             args[1024];
+    SHELLEXECUTEINFOW sei;
+
+    lstrcpynW(args, PathGetArgsW(GetCommandLineW()), 900);
+    wsprintfW(args + lstrlenW(args), L" -wait %lu%s%s", GetCurrentProcessId(),
+              extra ? L" " : L"", extra ? extra : L"");
+    ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOASYNC;
+    sei.lpVerb       = L"runas";
+    sei.lpFile       = g_exePath;
+    sei.lpParameters = args;
+    sei.nShow        = SW_SHOWNORMAL;
+    if (ShellExecuteExW(&sei)) return TRUE;
+    log_printf(L"管理者として起動できませんでした (%lu)", GetLastError());
+    return FALSE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -145,6 +135,7 @@ static void tray_tip(WCHAR *tip, int cch)
     else if (g_cfg.accept) lstrcpynW(tip, L"input-mouser — 操作を受け付けています", cch);
     else lstrcpynW(tip, L"input-mouser", cch);
     if (g_locked && lstrlenW(tip) + 8 < cch) lstrcatW(tip, L"（固定中）");
+    if (g_elevated && lstrlenW(tip) + 8 < cch) lstrcatW(tip, L"（管理者）");
 }
 
 void tray_update(void)
@@ -372,7 +363,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     int     argc, i, cmd = 0, cmdArg = 0;
     BOOL    openSettings = FALSE, first, noHook = FALSE;
     INITCOMMONCONTROLSEX icc;
-    DWORD   n;
+    DWORD   n, waitPid = 0;
 
     (void)prev; (void)cmdline; (void)show;
     g_inst = inst;
@@ -392,6 +383,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"settings")) openSettings = TRUE;
         else if (!lstrcmpiW(a, L"dryrun"))   g_dryRun = TRUE;
         else if (!lstrcmpiW(a, L"nohook"))   noHook = TRUE;
+        else if (!lstrcmpiW(a, L"wait") && i + 1 < argc) waitPid = (DWORD)StrToIntW(argv[++i]);
         else if (!lstrcmpiW(a, L"bind") && i + 1 < argc) lstrcpynW(g_bindAddr, argv[++i], 64);
         else if (!lstrcmpiW(a, L"switch") && i + 1 < argc) {
             const WCHAR *v = argv[++i];
@@ -401,7 +393,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     }
     if (argv) LocalFree(argv);
     if (!g_customIni) default_ini();
-    if (g_bindAddr[0]) wsprintfW(g_extraArgs, L"-bind %s", g_bindAddr);
+    if (waitPid) {                  /* 起動し直す前の自分が終わるまで待つ */
+        HANDLE old = OpenProcess(SYNCHRONIZE, FALSE, waitPid);
+        if (old) { WaitForSingleObject(old, 15000); CloseHandle(old); }
+    }
 
     /* 同じ設定ファイルで動いているものがあれば、そちらに頼んで終わる */
     mutex_name(mname);
@@ -445,14 +440,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 
     first = GetFileAttributesW(g_iniPath) == INVALID_FILE_ATTRIBUTES;
     config_load();
+    g_elevated = is_elevated();
+    if (g_cfg.admin && !g_elevated) {
+        /* 管理者として動かす設定なので、起動し直す。断られたら普通の権限のまま動く */
+        if (mutex) CloseHandle(mutex);
+        if (app_relaunch_elevated(openSettings ? L"-settings" : NULL)) return 0;
+        mutex = CreateMutexW(NULL, FALSE, mname);
+    }
     theme_init();                   /* ini の theme= を見るので読み込みの後 */
     layout_register();
     if (first) {
         config_save();              /* 次からは黙って常駐を始めるように */
         openSettings = TRUE;
     }
-    log_printf(L"input-mouser %s 起動 (%s、設定 %s%s)", APP_VERSION, g_hostName, g_iniPath,
-               g_dryRun ? L"、dryrun" : L"");
+    log_printf(L"input-mouser %s 起動 (%s、設定 %s%s%s)", APP_VERSION, g_hostName, g_iniPath,
+               g_elevated ? L"、管理者" : L"", g_dryRun ? L"、dryrun" : L"");
 
     g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     ZeroMemory(&wc, sizeof(wc));
@@ -465,6 +467,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
                                 0, 0, 0, 0, NULL, NULL, inst, NULL);
     if (!g_trayWnd) return 1;
     ChangeWindowMessageFilterEx(g_trayWnd, g_wmTaskbarCreated, MSGFLT_ALLOW, NULL);
+    /* 管理者で動いているときも、普通の権限からの -exit / -switch / 二重起動を受ける */
+    ChangeWindowMessageFilterEx(g_trayWnd, WM_APP_COMMAND, MSGFLT_ALLOW, NULL);
     theme_allow_dark(g_trayWnd);
     tray_add();
 

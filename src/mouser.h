@@ -38,7 +38,7 @@
 #include <shellapi.h>
 
 #define APP_NAME     L"input-mouser"
-#define APP_VERSION  L"1.0.0"
+#define APP_VERSION  L"1.1.0"
 
 #define DEFAULT_PORT 31860
 #define PEER_MAX     8          /* 登録できる相手の数 */
@@ -82,6 +82,7 @@ typedef struct {
     int    clipMaxMB;       /* 送るクリップボードの上限(ini のみ) */
     Hotkey hkHome;          /* このPC に戻る */
     Hotkey hkLock;          /* 切り替えを固定する(入/切) */
+    BOOL   admin;           /* 管理者として動かす(管理者のウィンドウも操作できるように) */
     BOOL   osd;             /* 切り替えたとき画面に小さく知らせる(ini のみ) */
     BOOL   log;
     int    theme;           /* 0 = システム / 1 = ライト / 2 = ダーク(ini のみ) */
@@ -99,6 +100,7 @@ extern HWND      g_trayWnd;
 extern WCHAR     g_hostName[HOST_MAX];  /* この PC の名前 */
 extern WCHAR     g_bindAddr[64];        /* -bind(検証用。受け付けるアドレスを絞る) */
 extern BOOL      g_dryRun;              /* -dryrun(検証用。入力を再現せずログに書く) */
+extern BOOL      g_elevated;            /* 管理者として動いている */
 
 /* UI スレッド(トレイのウィンドウ)への知らせ */
 #define WM_APP_TRAY      (WM_APP + 1)
@@ -115,8 +117,7 @@ extern BOOL      g_dryRun;              /* -dryrun(検証用。入力を再現�
 
 void log_printf(const WCHAR *fmt, ...);
 void tray_update(void);
-BOOL startup_enabled(void);
-BOOL startup_set(BOOL on);
+BOOL app_relaunch_elevated(const WCHAR *extra);
 
 /* ------------------------------------------------------------------ */
 /*  config.c                                                           */
