@@ -38,7 +38,7 @@
 #include <shellapi.h>
 
 #define APP_NAME     L"input-mouser"
-#define APP_VERSION  L"v6"      /* リリースのタグ(vN)と同じ。表示はこのまま */
+#define APP_VERSION  L"v7"      /* リリースのタグ(vN)と同じ。表示はこのまま */
 
 #define DEFAULT_PORT 31860
 #define PEER_MAX     8          /* 登録できる相手の数 */

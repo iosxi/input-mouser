@@ -235,6 +235,7 @@ void inj_button(int btn, BOOL down)
 
     if (btn < 0 || btn > 4) return;
     g_btnDown[btn] = (BYTE)down;
+    if (g_active >= 0) cursor_follow(cursor_now());     /* 出てきたメニューの上へ上げ直す */
     if (g_dryRun) { log_printf(L"[dryrun] button %d %s", btn, down ? L"down" : L"up"); return; }
     ZeroMemory(&in, sizeof(in));
     in.type           = INPUT_MOUSE;

@@ -18,6 +18,12 @@
  *
  *  位置の知らせは net スレッドから来る。毎回窓を動かすと重いので、最新の
  *  位置だけを置いて UI スレッドへ 1 通だけ知らせ、UI スレッドが動かす。
+ *
+ *  v7: 右クリックのメニューは最前面の窓として後から出るので、描いたカーソルの
+ *  上に重なる(2026-10-04 実測: 開いた直後はメニューが上、上げ直すと描いた方が上)。
+ *  描いている間は 150ms ごとと、ボタンを押したときにも最前面へ上げ直す。
+ *  また「描くか」は操作が来るたびではなく、操作の間は描き続ける(途中で Windows の
+ *  答えが変わっても引っ込めない。描いていなかったときだけ、途中からでも描き始める)。
  * ================================================================== */
 
 #include "mouser.h"
@@ -30,6 +36,10 @@ static HWND          g_cw;
 static HCURSOR       g_shape;
 static POINT         g_hot;
 static volatile LONG g_x, g_y, g_want, g_pending;
+static LONG          g_session;     /* この操作の間は描く(net スレッドだけが触る) */
+static LONG          g_lastFlags = -1;
+
+#define RAISE_MS 150
 
 /* ------------------------------------------------------------------ */
 /*  net スレッドから                                                    */
@@ -45,7 +55,22 @@ static BOOL system_draws_cursor(void)
 /* 操作されている間に呼ぶ。p はカーソルの位置 */
 void cursor_follow(POINT p)
 {
-    LONG want = g_drawCursor == 2 || g_dryRun || (g_drawCursor == 1 && !system_draws_cursor());
+    LONG want;
+    if (!g_session && g_drawCursor) {
+        BOOL sys = system_draws_cursor();
+        if (g_drawCursor == 2 || g_dryRun || !sys) g_session = 1;
+    }
+    if (g_drawCursor == 1 && g_cfg.log) {   /* Windows の答えが変わったら記録する(調べるため) */
+        CURSORINFO ci;
+        ci.cbSize = sizeof(ci);
+        if (GetCursorInfo(&ci) && (LONG)(ci.flags & CURSOR_SHOWING) != g_lastFlags) {
+            if (g_lastFlags >= 0)
+                log_printf(L"カーソルの状態が変わりました: %s", (ci.flags & CURSOR_SHOWING)
+                           ? L"Windows が描いている" : L"Windows は描いていない");
+            g_lastFlags = (LONG)(ci.flags & CURSOR_SHOWING);
+        }
+    }
+    want = g_drawCursor && g_session;
     InterlockedExchange(&g_x, p.x);
     InterlockedExchange(&g_y, p.y);
     InterlockedExchange(&g_want, want);
@@ -55,6 +80,8 @@ void cursor_follow(POINT p)
 
 void cursor_hide(void)
 {
+    g_session   = 0;
+    g_lastFlags = -1;
     InterlockedExchange(&g_want, 0);
     if (g_cw && !InterlockedExchange(&g_pending, 1) && g_trayWnd)
         PostMessageW(g_trayWnd, WM_APP_CURSOR, 0, 0);
@@ -69,7 +96,7 @@ void cursor_log_state(void)
     if (GetCursorInfo(&ci))
         log_printf(L"カーソルの状態: flags=%lu(%s)、形=%p、自分で描く=%s", ci.flags,
                    (ci.flags & CURSOR_SHOWING) ? L"Windows が描いている" : L"Windows は描いていない",
-                   (void *)ci.hCursor, g_want ? L"はい" : L"いいえ");
+                   (void *)ci.hCursor, g_session ? L"はい" : L"いいえ");
 }
 
 /* ------------------------------------------------------------------ */
@@ -79,6 +106,13 @@ void cursor_log_state(void)
 static LRESULT CALLBACK cursor_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_TIMER) {          /* 後から出たメニューなどの上へ上げ直す */
+        if (IsWindowVisible(h))
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        else
+            KillTimer(h, 1);
+        return 0;
+    }
     return DefWindowProcW(h, msg, wp, lp);
 }
 
@@ -169,7 +203,7 @@ void cursor_apply(void)
 
     InterlockedExchange(&g_pending, 0);
     if (!g_want) {
-        if (g_cw) ShowWindow(g_cw, SW_HIDE);
+        if (g_cw) { KillTimer(g_cw, 1); ShowWindow(g_cw, SW_HIDE); }
         return;
     }
     if (!g_cw) {
@@ -194,4 +228,5 @@ void cursor_apply(void)
     }
     SetWindowPos(g_cw, HWND_TOPMOST, g_x - g_hot.x, g_y - g_hot.y, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetTimer(g_cw, 1, RAISE_MS, NULL);      /* 描いている間だけ動く */
 }
