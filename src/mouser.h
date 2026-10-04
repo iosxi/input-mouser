@@ -38,7 +38,7 @@
 #include <shellapi.h>
 
 #define APP_NAME     L"input-mouser"
-#define APP_VERSION  L"v8"      /* リリースのタグ(vN)と同じ。表示はこのまま */
+#define APP_VERSION  L"v9"      /* リリースのタグ(vN)と同じ。表示はこのまま */
 
 #define DEFAULT_PORT 31860
 #define PEER_MAX     8          /* 登録できる相手の数 */
@@ -83,7 +83,7 @@ typedef struct {
     Hotkey hkHome;          /* このPC に戻る */
     Hotkey hkLock;          /* 切り替えを固定する(入/切) */
     BOOL   admin;           /* 管理者として動かす(管理者のウィンドウも操作できるように) */
-    int    drawCursor;      /* マウスのない PC のカーソル 0 / 1(マウスキーで Windows に描かせる) / 2(自分で描く) */
+    int    drawCursor;      /* マウスのない PC のカーソル 0 / 1(マウスキー＋足りなければ自分で描く) / 2(自分で描くだけ) */
     BOOL   osd;             /* 切り替えたとき画面に小さく知らせる(ini のみ) */
     BOOL   log;
     int    theme;           /* 0 = システム / 1 = ライト / 2 = ダーク(ini のみ) */

@@ -15,8 +15,16 @@
  *      操作されている間だけ SystemParametersInfo(SPI_SETMOUSEKEYS) で有効にし、
  *      離れたら元に戻す。SPIF_UPDATEINIFILE を付けないのでレジストリには書かない
  *      (2026-10-04 実測: 有効にしている最中も HKCU の MouseKeys\Flags は 62 のまま)。
- *      通知領域の表示は出さず、テンキーで動くのは Num Lock が切れているときだけにする。
- *  draw_cursor=2 は、v6〜v7 の「自分で描く」。マウスキーで出ない PC 向けに残す。
+ *      通知領域の表示は出さない。
+ *  v9: v8 は「Num Lock が切れているときだけ働く」にしていたが、遠隔の利用者の環境で
+ *      カーソルが出なくなった(Num Lock はふつう入っているので、マウスキーが有効でも
+ *      働いていなかったと考えている。他社の回避策は Windows の既定=Num Lock が入って
+ *      いるときに働く、のまま有効にしている)。そこで「今の Num Lock の状態でいつも
+ *      働く」ように合わせ、Num Lock が変わったら合わせ直す。代わりに、操作されている
+ *      間はテンキーがマウスキーに使われる。
+ *      さらに、それでも Windows が描いていないときは自分でも描く(v7 の描き方。
+ *      Windows が描き始めたら引っ込める)。どちらに転んでもカーソルは見える。
+ *  draw_cursor=2 は「自分で描く」だけ(マウスキーを使わない)。
  *  自分で描くのは、操作されている間で Windows がカーソルを描いていないとき
  *  (-dryrun では常に描く)。
  *
@@ -67,6 +75,30 @@ static BOOL system_draws_cursor(void)
 
 static MOUSEKEYS g_mkSaved;
 static BOOL      g_mkChanged;
+static int       g_mkNumLock = -1;  /* 合わせた Num Lock の状態 */
+
+static int numlock_on(void) { return GetKeyState(VK_NUMLOCK) & 1; }    /* 通信スレッドからも読める(実測) */
+
+/* Num Lock の今の状態で働くように設定する */
+static BOOL mousekeys_apply(void)
+{
+    MOUSEKEYS mk = g_mkSaved;
+    int       nl = numlock_on();
+    mk.cbSize  = sizeof(mk);
+    /* ショートカット キーなど利用者の好みは残し、通知領域の表示は外す */
+    mk.dwFlags = (g_mkSaved.dwFlags & (MKF_HOTKEYACTIVE | MKF_CONFIRMHOTKEY | MKF_HOTKEYSOUND | MKF_MODIFIERS)) |
+                 MKF_MOUSEKEYSON | MKF_AVAILABLE | (nl ? MKF_REPLACENUMBERS : 0);
+    if (!SystemParametersInfoW(SPI_SETMOUSEKEYS, sizeof(mk), &mk, 0)) return FALSE;     /* 保存しない */
+    g_mkNumLock = nl;
+    return TRUE;
+}
+
+/* Num Lock が変わっていたら合わせ直す(操作の途中で呼ぶ) */
+static void mousekeys_sync(void)
+{
+    if (g_mkChanged && numlock_on() != g_mkNumLock && mousekeys_apply())
+        log_printf(L"Num Lock が%sになったので、マウスキーを合わせ直しました", g_mkNumLock ? L"入" : L"切");
+}
 
 void mousekeys_begin(void)
 {
@@ -76,13 +108,10 @@ void mousekeys_begin(void)
     if (!SystemParametersInfoW(SPI_GETMOUSEKEYS, sizeof(mk), &mk, 0)) return;
     if (mk.dwFlags & MKF_MOUSEKEYSON) return;           /* 利用者が自分で有効にしている */
     g_mkSaved = mk;
-    /* ショートカット キーなど利用者の好みは残し、通知領域の表示と
-       「Num Lock が入っているときに動く」は外す */
-    mk.dwFlags = (mk.dwFlags & (MKF_HOTKEYACTIVE | MKF_CONFIRMHOTKEY | MKF_HOTKEYSOUND | MKF_MODIFIERS)) |
-                 MKF_MOUSEKEYSON | MKF_AVAILABLE;
-    if (SystemParametersInfoW(SPI_SETMOUSEKEYS, sizeof(mk), &mk, 0)) {     /* 保存しない */
+    if (mousekeys_apply()) {
         g_mkChanged = TRUE;
-        log_printf(L"マウスキーを有効にしました(操作されている間だけ。元 0x%08lX)", g_mkSaved.dwFlags);
+        log_printf(L"マウスキーを有効にしました(操作されている間だけ。Num Lock %s で働く。元 0x%08lX)",
+                   g_mkNumLock ? L"入" : L"切", g_mkSaved.dwFlags);
     } else {
         log_printf(L"マウスキーを有効にできませんでした (%lu)", GetLastError());
     }
@@ -92,6 +121,7 @@ void mousekeys_end(void)
 {
     if (!g_mkChanged) return;
     g_mkChanged = FALSE;
+    g_mkNumLock = -1;
     if (SystemParametersInfoW(SPI_SETMOUSEKEYS, sizeof(g_mkSaved), &g_mkSaved, 0))
         log_printf(L"マウスキーを元に戻しました");
     else
@@ -107,7 +137,12 @@ void cursor_follow(POINT p)
 {
     LONG want;
     if (g_drawCursor != 1 && g_mkChanged) mousekeys_end();    /* 設定を変えた */
-    if (!g_session && (g_drawCursor == 2 || (g_dryRun && g_drawCursor))) {
+    if (g_drawCursor == 1) {
+        /* マウスキーで Windows が描いていればそれに任せ、描いていなければ自分でも描く。
+           動くたびに見直す(マウスキーが効き始めたら引っ込める) */
+        mousekeys_sync();
+        g_session = g_dryRun || !system_draws_cursor();
+    } else if (!g_session && (g_drawCursor == 2 || (g_dryRun && g_drawCursor))) {
         if (g_drawCursor == 2 && !g_dryRun && system_draws_cursor()) {
             /* Windows が描いているなら描かない(マウスがつながった PC) */
         } else {
@@ -151,7 +186,8 @@ void cursor_log_state(void)
     if (GetCursorInfo(&ci))
         log_printf(L"カーソルの状態: flags=%lu(%s)、形=%p、方式=%s", ci.flags,
                    (ci.flags & CURSOR_SHOWING) ? L"Windows が描いている" : L"Windows は描いていない",
-                   (void *)ci.hCursor, g_drawCursor == 1 ? L"マウスキー" : g_session ? L"自分で描く" : L"描かない");
+                   (void *)ci.hCursor, g_drawCursor == 1 ? L"マウスキー＋足りなければ自分で描く" :
+                   g_session ? L"自分で描く" : L"描かない");
 }
 
 /* ------------------------------------------------------------------ */
