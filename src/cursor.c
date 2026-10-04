@@ -25,6 +25,14 @@
  *      さらに、それでも Windows が描いていないときは自分でも描く(v7 の描き方。
  *      Windows が描き始めたら引っ込める)。どちらに転んでもカーソルは見える。
  *  draw_cursor=2 は「自分で描く」だけ(マウスキーを使わない)。
+ *  v10: マウスキーが元から有効でも、操作の間は Num Lock に合わせ直す(v9 は手を付けず、
+ *      遠隔の利用者の環境ではマウスキーが働かないまま残っていたとみられる。ログに
+ *      「有効にしました」が無かった)。抜けた理由はすべてログに残す。
+ *      描いた絵は、ほかの窓が表示された・前面が変わったという Windows の知らせ
+ *      (WinEvent)を受けた瞬間にも手前へ上げ直す。log=1 なら、メニューなどが出たときの
+ *      窓の種類・層(バンド)・上げ直した後の重なりを記録する(23H2 のデスクトップの
+ *      右クリック メニューの下に隠れる件を調べるため。この PC = 新しい 11 では、
+ *      メニューは使っている間も手前へ出し直さず、一度上げ直せば絵が上に残った)。
  *  自分で描くのは、操作されている間で Windows がカーソルを描いていないとき
  *  (-dryrun では常に描く)。
  *
@@ -76,6 +84,8 @@ static BOOL system_draws_cursor(void)
 static MOUSEKEYS g_mkSaved;
 static BOOL      g_mkChanged;
 static int       g_mkNumLock = -1;  /* 合わせた Num Lock の状態 */
+static DWORD     g_enterTick;
+static BOOL      g_lateLogged = TRUE;
 
 static int numlock_on(void) { return GetKeyState(VK_NUMLOCK) & 1; }    /* 通信スレッドからも読める(実測) */
 
@@ -105,13 +115,18 @@ void mousekeys_begin(void)
     MOUSEKEYS mk;
     if (g_mkChanged) return;
     mk.cbSize = sizeof(mk);
-    if (!SystemParametersInfoW(SPI_GETMOUSEKEYS, sizeof(mk), &mk, 0)) return;
-    if (mk.dwFlags & MKF_MOUSEKEYSON) return;           /* 利用者が自分で有効にしている */
+    if (!SystemParametersInfoW(SPI_GETMOUSEKEYS, sizeof(mk), &mk, 0)) {
+        log_printf(L"マウスキーの設定を読めませんでした (%lu)", GetLastError());
+        return;
+    }
+    /* 元から有効でも、Num Lock の状態によっては働いていないので合わせ直す。
+       離れたら元の設定(g_mkSaved)に戻す */
     g_mkSaved = mk;
     if (mousekeys_apply()) {
         g_mkChanged = TRUE;
-        log_printf(L"マウスキーを有効にしました(操作されている間だけ。Num Lock %s で働く。元 0x%08lX)",
-                   g_mkNumLock ? L"入" : L"切", g_mkSaved.dwFlags);
+        log_printf(L"マウスキーを有効にしました(操作されている間だけ。Num Lock %s で働く。元は%s 0x%08lX)",
+                   g_mkNumLock ? L"入" : L"切", (g_mkSaved.dwFlags & MKF_MOUSEKEYSON) ? L"有効" : L"無効",
+                   g_mkSaved.dwFlags);
     } else {
         log_printf(L"マウスキーを有効にできませんでした (%lu)", GetLastError());
     }
@@ -149,6 +164,14 @@ void cursor_follow(POINT p)
             g_session = 1;
         }
     }
+    if (g_drawCursor && !g_lateLogged && GetTickCount() - g_enterTick > 500) {
+        CURSORINFO ci;
+        ci.cbSize = sizeof(ci);
+        g_lateLogged = TRUE;
+        if (GetCursorInfo(&ci))
+            log_printf(L"操作が来て 0.5 秒後のカーソルの状態: %s", (ci.flags & CURSOR_SHOWING)
+                       ? L"Windows が描いている(マウスキーが効いた)" : L"Windows は描いていない(自分で描く)");
+    }
     if (g_drawCursor && g_cfg.log) {   /* Windows の答えが変わったら記録する(調べるため) */
         CURSORINFO ci;
         ci.cbSize = sizeof(ci);
@@ -183,6 +206,8 @@ void cursor_log_state(void)
     CURSORINFO ci;
     ci.cbSize = sizeof(ci);
     if (!g_drawCursor) return;
+    g_enterTick  = GetTickCount();
+    g_lateLogged = FALSE;
     if (GetCursorInfo(&ci))
         log_printf(L"カーソルの状態: flags=%lu(%s)、形=%p、方式=%s", ci.flags,
                    (ci.flags & CURSOR_SHOWING) ? L"Windows が描いている" : L"Windows は描いていない",
@@ -194,17 +219,98 @@ void cursor_log_state(void)
 /*  UI スレッド                                                         */
 /* ------------------------------------------------------------------ */
 
+static HWINEVENTHOOK g_wehShow, g_wehFg;
+static HWND          g_diag;            /* 調べている最中のメニューなど */
+static HWND          g_seen[32];
+static int           g_nSeen;
+
+typedef BOOL (WINAPI *fnGetWindowBand)(HWND, DWORD *);
+
+static void raise_now(void)
+{
+    if (g_cw && IsWindowVisible(g_cw))
+        SetWindowPos(g_cw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+static BOOL above_of(HWND other)
+{
+    HWND w;
+    for (w = GetWindow(other, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV))
+        if (w == g_cw) return TRUE;
+    return FALSE;
+}
+
+static DWORD band_of(HWND h)
+{
+    static fnGetWindowBand p;
+    static BOOL tried;
+    DWORD b = 0;
+    if (!tried) {           /* 公開されていない関数なので、なければ 0 */
+        tried = TRUE;
+        p = (fnGetWindowBand)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetWindowBand");
+    }
+    if (p) p(h, &b);
+    return b;
+}
+
+/* ほかの窓が表示された・前面が変わった。すぐ上げ直し、少し後にもう一度 */
+static void CALLBACK win_event(HWINEVENTHOOK hk, DWORD ev, HWND hwnd, LONG obj, LONG child, DWORD tid, DWORD t)
+{
+    (void)hk; (void)tid; (void)t;
+    if (obj != OBJID_WINDOW || child != CHILDID_SELF || !hwnd || hwnd == g_cw) return;
+    if (!g_cw || !IsWindowVisible(g_cw)) return;
+    if (ev == EVENT_OBJECT_SHOW && GetAncestor(hwnd, GA_ROOT) != hwnd) return;     /* 子の窓は関係ない */
+    raise_now();
+    SetTimer(g_cw, 2, 40, NULL);
+    if (g_cfg.log && ev == EVENT_OBJECT_SHOW && (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+        int i;
+        for (i = 0; i < g_nSeen && g_seen[i] != hwnd; i++) ;
+        if (i == g_nSeen) {
+            if (g_nSeen < (int)ARRAYSIZE(g_seen)) g_seen[g_nSeen++] = hwnd;
+            g_diag = hwnd;
+        }
+    }
+}
+
 static LRESULT CALLBACK cursor_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
     if (msg == WM_TIMER) {          /* 後から出たメニューなどの上へ上げ直す */
-        if (IsWindowVisible(h))
-            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        else
-            KillTimer(h, 1);
+        if (!IsWindowVisible(h)) { KillTimer(h, wp); return 0; }
+        raise_now();
+        if (wp == 2) {
+            KillTimer(h, 2);
+            if (g_diag) {           /* 調べるための記録(log=1 のときだけ集めている) */
+                WCHAR cls[96];
+                DWORD pid = 0;
+                GetClassNameW(g_diag, cls, ARRAYSIZE(cls));
+                GetWindowThreadProcessId(g_diag, &pid);
+                log_printf(L"最前面の窓が出ました: %s (pid %lu、層 %lu、こちらの層 %lu) → 上げ直した後、描いた絵が%s",
+                           cls, pid, band_of(g_diag), band_of(h), above_of(g_diag) ? L"上" : L"下のまま");
+                g_diag = NULL;
+            }
+        }
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void events_on(void)
+{
+    if (!g_wehShow)
+        g_wehShow = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, win_event, 0, 0,
+                                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!g_wehFg)
+        g_wehFg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, win_event, 0, 0,
+                                  WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
+static void events_off(void)
+{
+    if (g_wehShow) { UnhookWinEvent(g_wehShow); g_wehShow = NULL; }
+    if (g_wehFg)   { UnhookWinEvent(g_wehFg);   g_wehFg = NULL; }
+    g_nSeen = 0;
+    g_diag  = NULL;
 }
 
 /* 32bpp の DIB を作る(上から下へ並ぶ向き) */
@@ -294,7 +400,8 @@ void cursor_apply(void)
 
     InterlockedExchange(&g_pending, 0);
     if (!g_want) {
-        if (g_cw) { KillTimer(g_cw, 1); ShowWindow(g_cw, SW_HIDE); }
+        if (g_cw) { KillTimer(g_cw, 1); KillTimer(g_cw, 2); ShowWindow(g_cw, SW_HIDE); }
+        events_off();
         return;
     }
     if (!g_cw) {
@@ -320,4 +427,5 @@ void cursor_apply(void)
     SetWindowPos(g_cw, HWND_TOPMOST, g_x - g_hot.x, g_y - g_hot.y, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetTimer(g_cw, 1, RAISE_MS, NULL);      /* 描いている間だけ動く */
+    events_on();                            /* 描いている間だけ、窓の表示の知らせを受ける */
 }
