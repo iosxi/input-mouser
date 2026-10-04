@@ -191,6 +191,7 @@ void inj_enter(int conn, int side, int pos)
     POINT p;
     g_active  = conn;
     g_edgeOut = FALSE;
+    if (g_drawCursor == 1) mousekeys_begin();       /* マウスのない PC で Windows にカーソルを描かせる */
     p = screen_entry(side, pos);
     move_abs(p);
     cursor_follow(p);

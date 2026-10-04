@@ -153,6 +153,24 @@
 - 検証用のメニューの窓は `FindWindow("#32768")`、重なり順は `GetWindow(GW_HWNDPREV)` でたどって比べる。
   検証用 C プログラムの printf は英数字だけにする（UTF-8 の日本語と PowerShell の出力が混ざると読めなくなる）。
 
+### マウスキー方式（v8）
+
+- v7 で直らなかった（利用者の報告）。他のアプリを調べた結果（2026-10-04）:
+  - PowerToys の Mouse Without Borders（`CustomCursor.cs`）は v6/v7 と同じく偽のカーソルを最前面の窓に描く
+    （`GetCursorInfo` の flags が 1 以外のとき）。メニューへの手当てはない。
+  - Amazon DCV の公式文書は「マウスキーを有効にする」を勧める。Steam Link・Synergy の利用者の報告も同じ。
+- そこで `draw_cursor=1` を「操作されている間だけマウスキーを有効にする」に変えた（`cursor.c` の
+  `mousekeys_begin` / `mousekeys_end`）。偽のカーソルは `draw_cursor=2` に残した。
+- 実測: `SPI_SETMOUSEKEYS` を `SPIF_UPDATEINIFILE` なしで呼ぶと、その場だけ有効になり、
+  HKCU の `Control Panel\Accessibility\MouseKeys` の `Flags` は 62 のまま変わらない。
+  受け手を dryrun で動かし、操作が来ると 0x9000001f（有効。利用者のショートカット キーの設定は残し、
+  通知領域の表示 0x20 は外す）、離れたとき・受け手を終了したときに 0x9000003e に戻ることを確かめた。
+  `-dryrun` でもマウスキーは切り替える（この PC のマウスキーが検証の数秒だけ有効になる）。
+- **「マウスキーでマウスのない PC にカーソルが出る」こと自体はこの PC では確かめられない**（マウスがある）。
+  他社の文書と報告が根拠。`MKF_REPLACENUMBERS` を外している（Num Lock が切れているときだけテンキーで動く）ので、
+  Num Lock の状態によってカーソルが出る・出ないが変わるなら、ここを見直す。
+- 検証用 PowerShell の関数名に `REG` を使わない（中の `reg` が自分自身を呼んで止まらなくなる）。
+
 ### 確かめていないこと
 
 - 2 台の PC の間で実際に使うこと（LAN 越しの接続、探索のブロードキャスト、ファイアウォールの確認画面）。

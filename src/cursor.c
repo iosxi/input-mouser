@@ -7,9 +7,18 @@
  *  そこで、透明でクリックの素通りする小窓にカーソルの形を描き、位置を追わせる
  *  (PowerToys の Mouse Without Borders の「カーソルを描く」と同じ考え)。
  *
- *  描くのは、設定が入っていて、相手から操作されている間で、Windows が
- *  カーソルを描いていない(GetCursorInfo に CURSOR_SHOWING がない)ときだけ。
- *  ini の draw_cursor=2 なら、Windows が描いていても描く(判定が合わない PC 向け)。
+ *  v8 からの既定(draw_cursor=1)は「マウスキー」を使う。
+ *      Windows の補助機能のマウスキーが有効だと、マウスがなくても Windows 自身が
+ *      本物のカーソルを描く(Amazon DCV の公式文書の回避策。Steam Link や Synergy の
+ *      利用者の報告も同じ)。描くのが Windows なので、右クリックのメニューなど
+ *      後から手前に出る窓の上でも、形が変わっても本物どおりに出る。
+ *      操作されている間だけ SystemParametersInfo(SPI_SETMOUSEKEYS) で有効にし、
+ *      離れたら元に戻す。SPIF_UPDATEINIFILE を付けないのでレジストリには書かない
+ *      (2026-10-04 実測: 有効にしている最中も HKCU の MouseKeys\Flags は 62 のまま)。
+ *      通知領域の表示は出さず、テンキーで動くのは Num Lock が切れているときだけにする。
+ *  draw_cursor=2 は、v6〜v7 の「自分で描く」。マウスキーで出ない PC 向けに残す。
+ *  自分で描くのは、操作されている間で Windows がカーソルを描いていないとき
+ *  (-dryrun では常に描く)。
  *
  *  形の取り出し: 黒地と白地に DrawIconEx で 1 回ずつ描き、
  *      不透明度 = 255 − (白地 − 黒地)、色(乗算済み) = 黒地の値
@@ -28,7 +37,7 @@
 
 #include "mouser.h"
 
-volatile LONG g_drawCursor;         /* 0 = 描かない / 1 = Windows が描いていないとき / 2 = いつも */
+volatile LONG g_drawCursor;         /* 0 = しない / 1 = マウスキーで Windows に描かせる / 2 = 自分で描く */
 
 #define CURSOR_CLASS L"InputMouser.Cursor"
 
@@ -52,15 +61,60 @@ static BOOL system_draws_cursor(void)
     return GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING);
 }
 
+/* ------------------------------------------------------------------ */
+/*  マウスキー(draw_cursor=1)                                          */
+/* ------------------------------------------------------------------ */
+
+static MOUSEKEYS g_mkSaved;
+static BOOL      g_mkChanged;
+
+void mousekeys_begin(void)
+{
+    MOUSEKEYS mk;
+    if (g_mkChanged) return;
+    mk.cbSize = sizeof(mk);
+    if (!SystemParametersInfoW(SPI_GETMOUSEKEYS, sizeof(mk), &mk, 0)) return;
+    if (mk.dwFlags & MKF_MOUSEKEYSON) return;           /* 利用者が自分で有効にしている */
+    g_mkSaved = mk;
+    /* ショートカット キーなど利用者の好みは残し、通知領域の表示と
+       「Num Lock が入っているときに動く」は外す */
+    mk.dwFlags = (mk.dwFlags & (MKF_HOTKEYACTIVE | MKF_CONFIRMHOTKEY | MKF_HOTKEYSOUND | MKF_MODIFIERS)) |
+                 MKF_MOUSEKEYSON | MKF_AVAILABLE;
+    if (SystemParametersInfoW(SPI_SETMOUSEKEYS, sizeof(mk), &mk, 0)) {     /* 保存しない */
+        g_mkChanged = TRUE;
+        log_printf(L"マウスキーを有効にしました(操作されている間だけ。元 0x%08lX)", g_mkSaved.dwFlags);
+    } else {
+        log_printf(L"マウスキーを有効にできませんでした (%lu)", GetLastError());
+    }
+}
+
+void mousekeys_end(void)
+{
+    if (!g_mkChanged) return;
+    g_mkChanged = FALSE;
+    if (SystemParametersInfoW(SPI_SETMOUSEKEYS, sizeof(g_mkSaved), &g_mkSaved, 0))
+        log_printf(L"マウスキーを元に戻しました");
+    else
+        log_printf(L"マウスキーを元に戻せませんでした (%lu)", GetLastError());
+}
+
+/* ------------------------------------------------------------------ */
+/*  自分で描く(draw_cursor=2)                                          */
+/* ------------------------------------------------------------------ */
+
 /* 操作されている間に呼ぶ。p はカーソルの位置 */
 void cursor_follow(POINT p)
 {
     LONG want;
-    if (!g_session && g_drawCursor) {
-        BOOL sys = system_draws_cursor();
-        if (g_drawCursor == 2 || g_dryRun || !sys) g_session = 1;
+    if (g_drawCursor != 1 && g_mkChanged) mousekeys_end();    /* 設定を変えた */
+    if (!g_session && (g_drawCursor == 2 || (g_dryRun && g_drawCursor))) {
+        if (g_drawCursor == 2 && !g_dryRun && system_draws_cursor()) {
+            /* Windows が描いているなら描かない(マウスがつながった PC) */
+        } else {
+            g_session = 1;
+        }
     }
-    if (g_drawCursor == 1 && g_cfg.log) {   /* Windows の答えが変わったら記録する(調べるため) */
+    if (g_drawCursor && g_cfg.log) {   /* Windows の答えが変わったら記録する(調べるため) */
         CURSORINFO ci;
         ci.cbSize = sizeof(ci);
         if (GetCursorInfo(&ci) && (LONG)(ci.flags & CURSOR_SHOWING) != g_lastFlags) {
@@ -70,7 +124,7 @@ void cursor_follow(POINT p)
             g_lastFlags = (LONG)(ci.flags & CURSOR_SHOWING);
         }
     }
-    want = g_drawCursor && g_session;
+    want = g_session;
     InterlockedExchange(&g_x, p.x);
     InterlockedExchange(&g_y, p.y);
     InterlockedExchange(&g_want, want);
@@ -80,6 +134,7 @@ void cursor_follow(POINT p)
 
 void cursor_hide(void)
 {
+    mousekeys_end();
     g_session   = 0;
     g_lastFlags = -1;
     InterlockedExchange(&g_want, 0);
@@ -94,9 +149,9 @@ void cursor_log_state(void)
     ci.cbSize = sizeof(ci);
     if (!g_drawCursor) return;
     if (GetCursorInfo(&ci))
-        log_printf(L"カーソルの状態: flags=%lu(%s)、形=%p、自分で描く=%s", ci.flags,
+        log_printf(L"カーソルの状態: flags=%lu(%s)、形=%p、方式=%s", ci.flags,
                    (ci.flags & CURSOR_SHOWING) ? L"Windows が描いている" : L"Windows は描いていない",
-                   (void *)ci.hCursor, g_session ? L"はい" : L"いいえ");
+                   (void *)ci.hCursor, g_drawCursor == 1 ? L"マウスキー" : g_session ? L"自分で描く" : L"描かない");
 }
 
 /* ------------------------------------------------------------------ */

@@ -520,6 +520,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 
     hook_stop();
     net_stop();
+    mousekeys_end();                /* 接続を閉じるときに戻しているが、念のため */
     log_printf(L"input-mouser 終了");
     CoUninitialize();
     if (mutex) CloseHandle(mutex);
