@@ -109,8 +109,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 4,0,0,0
- PRODUCTVERSION 4,0,0,0
+ FILEVERSION 5,0,0,0
+ PRODUCTVERSION 5,0,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -120,9 +120,9 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "nekoryu"
             VALUE "FileDescription", "input-mouser - 1 組のキーボードとマウスで複数の PC を操作"
-            VALUE "FileVersion", "v4"
+            VALUE "FileVersion", "v5"
             VALUE "ProductName", "input-mouser"
-            VALUE "ProductVersion", "v4"
+            VALUE "ProductVersion", "v5"
             VALUE "Comments", "画面の端を越えると、LAN でつながった隣の PC を操作できます"
             VALUE "OriginalFilename", "input-mouser.exe"
         END

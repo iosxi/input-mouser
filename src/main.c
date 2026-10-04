@@ -8,14 +8,18 @@
  *  input-mouser.exe -exit           動いている input-mouser を終わらせる
  *  input-mouser.exe -ini <path>     設定ファイルを指定する(既定は exe と同じ場所)
  *  input-mouser.exe -log            動作を <設定ファイル名>.log に書く
+ *  input-mouser.exe -fwremove       Windows ファイアウォールの input-mouser の許可を消す(後始末)
  *  input-mouser.exe -wait <pid>     その PID が終わるのを待ってから始める
  *                                   (管理者として起動し直すときに自分で付ける)
+ *  input-mouser.exe -fwremove-now   確認なしで消して終わる(管理者で自分を呼ぶときに付ける)。
+ *                                   終了コード = 消した数 | 残った数 << 8、失敗は 0xFFFF
  *
  *  検証用
  *  input-mouser.exe -bind <addr>    受け付けるアドレスを絞る(127.0.0.1 など)
  *  input-mouser.exe -dryrun         受けた入力を再現せず、ログに書くだけにする
  *  input-mouser.exe -nohook         フックを掛けない(画面の確認で、切り替わらないように)
  *  input-mouser.exe -name <名前>    この名前で名乗る(名前で引けない相手への接続を確かめる)
+ *  input-mouser.exe -fwprefix <s>   -fwremove で消す規則の名前の先頭を変える(本物の規則を消さずに確かめる)
  *
  *  多重起動の判定は設定ファイルごと。-ini で別の設定を指定すれば
  *  並べて動かせる(検証用)。
@@ -197,6 +201,7 @@ static void tray_menu(int x, int y)
         AppendMenuW(m, MF_STRING | (hook_paused() ? MF_CHECKED : 0), IDM_PAUSE, L"一時停止(&P)");
     }
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_FIREWALL, L"ファイアウォールの許可を削除(&F)...");
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"終了(&X)");
     SetMenuDefaultItem(m, IDM_SETTINGS, FALSE);
 
@@ -271,6 +276,7 @@ static LRESULT CALLBACK tray_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         case IDM_HOME:     hook_switch(-1); break;
         case IDM_LOCK:     hook_toggle_lock(); break;
         case IDM_PAUSE:    hook_set_paused(!hook_paused()); break;
+        case IDM_FIREWALL: fw_cleanup_ui(NULL, TRUE); break;
         case IDM_EXIT:     DestroyWindow(h); break;
         }
         return 0;
@@ -362,7 +368,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     MSG     msg;
     LPWSTR *argv;
     int     argc, i, cmd = 0, cmdArg = 0;
-    BOOL    openSettings = FALSE, first, noHook = FALSE;
+    BOOL    openSettings = FALSE, first, noHook = FALSE, fwRemove = FALSE, fwRemoveNow = FALSE;
     INITCOMMONCONTROLSEX icc;
     DWORD   n, waitPid = 0;
     WCHAR   fakeName[HOST_MAX] = L"";
@@ -385,6 +391,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"settings")) openSettings = TRUE;
         else if (!lstrcmpiW(a, L"dryrun"))   g_dryRun = TRUE;
         else if (!lstrcmpiW(a, L"nohook"))   noHook = TRUE;
+        else if (!lstrcmpiW(a, L"fwremove"))     fwRemove = TRUE;
+        else if (!lstrcmpiW(a, L"fwremove-now")) fwRemoveNow = TRUE;
+        else if (!lstrcmpiW(a, L"fwprefix") && i + 1 < argc) lstrcpynW(g_fwPrefix, argv[++i], 32);
         else if (!lstrcmpiW(a, L"name") && i + 1 < argc) lstrcpynW(fakeName, argv[++i], HOST_MAX);
         else if (!lstrcmpiW(a, L"wait") && i + 1 < argc) waitPid = (DWORD)StrToIntW(argv[++i]);
         else if (!lstrcmpiW(a, L"bind") && i + 1 < argc) lstrcpynW(g_bindAddr, argv[++i], 64);
@@ -395,7 +404,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         }
     }
     if (argv) LocalFree(argv);
+
+    if (fwRemoveNow) {              /* 管理者で呼ばれて、消すだけ */
+        int left = 0, n;
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        n = fw_remove(&left);
+        CoUninitialize();
+        return n < 0 ? 0xFFFF : (n & 0xFF) | ((left & 0xFF) << 8);
+    }
     if (!g_customIni) default_ini();
+    if (fwRemove) {                 /* 常駐せず、後始末の画面だけ出す */
+        INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_STANDARD_CLASSES };
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        InitCommonControlsEx(&ic);
+        config_load();
+        theme_init();
+        g_elevated = is_elevated();
+        fw_cleanup_ui(NULL, FALSE);
+        CoUninitialize();
+        return 0;
+    }
     if (waitPid) {                  /* 起動し直す前の自分が終わるまで待つ */
         HANDLE old = OpenProcess(SYNCHRONIZE, FALSE, waitPid);
         if (old) { WaitForSingleObject(old, 15000); CloseHandle(old); }

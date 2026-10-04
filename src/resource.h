@@ -58,4 +58,5 @@
 #define IDM_LOCK           2002
 #define IDM_PAUSE          2003
 #define IDM_EXIT           2004
+#define IDM_FIREWALL       2005
 #define IDM_PEER0          2100     /* + 相手の番号 */
