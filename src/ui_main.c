@@ -56,6 +56,7 @@ static void fill(void)
     CheckDlgButton(g_main, IDC_NODRAG,  g_cfg.noDragSwitch ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_main, IDC_CLIP,    g_cfg.clipboard ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_main, IDC_ADMIN,   g_cfg.admin ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(g_main, IDC_DRAWCUR, g_cfg.drawCursor ? BST_CHECKED : BST_UNCHECKED);
     hotkey_edit_attach(GetDlgItem(g_main, IDC_HK_HOME), &g_cfg.hkHome);
     hotkey_edit_attach(GetDlgItem(g_main, IDC_HK_LOCK), &g_cfg.hkLock);
     wsprintfW(t, L"設定ファイル: %s", g_iniPath);
@@ -242,6 +243,14 @@ static INT_PTR CALLBACK main_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             g_cfg.accept = IsDlgButtonChecked(h, IDC_ACCEPT) == BST_CHECKED;
             config_changed();
             update_info();
+            return TRUE;
+        case IDC_DRAWCUR:
+            if (IsDlgButtonChecked(h, IDC_DRAWCUR) == BST_CHECKED) {
+                if (!g_cfg.drawCursor) g_cfg.drawCursor = 1;        /* ini で 2 にしてあればそのまま */
+            } else {
+                g_cfg.drawCursor = 0;
+            }
+            config_changed();
             return TRUE;
         case IDC_NODRAG:
             g_cfg.noDragSwitch = IsDlgButtonChecked(h, IDC_NODRAG) == BST_CHECKED;

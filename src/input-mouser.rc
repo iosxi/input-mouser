@@ -14,7 +14,7 @@ IDI_ACTIVE ICON "input-mouser-active.ico"
 // ------------------------------------------------------------------
 //  設定画面
 // ------------------------------------------------------------------
-IDD_MAIN DIALOGEX 0, 0, 420, 350
+IDD_MAIN DIALOGEX 0, 0, 420, 362
 STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "input-mouser"
@@ -30,16 +30,17 @@ BEGIN
 
     LTEXT           "このPC", IDC_H_THIS, 12, 170, 190, 11
     AUTOCHECKBOX    "ほかの PC からの操作を受け付ける(&R)", IDC_ACCEPT, 12, 184, 190, 10
-    LTEXT           "ポート(&O)", IDC_PORT_LBL, 12, 200, 46, 9
-    EDITTEXT        IDC_PORT, 60, 198, 40, 14, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "", IDC_THIS_INFO, 12, 216, 194, 18, SS_NOPREFIX
-    LTEXT           "パスワード", IDC_PASS_LBL, 12, 240, 46, 9
-    LTEXT           "", IDC_PASS_STATE, 60, 240, 84, 9, SS_NOPREFIX | SS_ENDELLIPSIS
-    PUSHBUTTON      "変更(&W)...", IDC_PASS, 148, 237, 58, 15
-    LTEXT           "全般", IDC_H_GENERAL, 12, 262, 190, 11
-    AUTOCHECKBOX    "管理者として動かす(&M)", IDC_ADMIN, 12, 276, 194, 10
+    AUTOCHECKBOX    "マウスのない PC でもカーソルを表示する(&U)", IDC_DRAWCUR, 12, 198, 194, 10
+    LTEXT           "ポート(&O)", IDC_PORT_LBL, 12, 214, 46, 9
+    EDITTEXT        IDC_PORT, 60, 212, 40, 14, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "", IDC_THIS_INFO, 12, 230, 194, 18, SS_NOPREFIX
+    LTEXT           "パスワード", IDC_PASS_LBL, 12, 254, 46, 9
+    LTEXT           "", IDC_PASS_STATE, 60, 254, 84, 9, SS_NOPREFIX | SS_ENDELLIPSIS
+    PUSHBUTTON      "変更(&W)...", IDC_PASS, 148, 251, 58, 15
+    LTEXT           "全般", IDC_H_GENERAL, 12, 274, 190, 11
+    AUTOCHECKBOX    "管理者として動かす(&M)", IDC_ADMIN, 12, 288, 194, 10
     LTEXT           "管理者のウィンドウ（タスク マネージャーなど）も操作できます。",
-                    IDC_HINT_ADMIN, 24, 289, 182, 9
+                    IDC_HINT_ADMIN, 24, 301, 182, 9
 
     LTEXT           "切り替え", IDC_H_SWITCH, 220, 170, 188, 11
     LTEXT           "端で押し続ける時間(&T)", -1, 220, 186, 86, 9
@@ -57,8 +58,8 @@ BEGIN
     LTEXT           "欄を選んでキーを押すと登録されます。Delete で消せます。",
                     IDC_HINT_SWITCH, 220, 286, 188, 18
 
-    LTEXT           "", IDC_INIPATH, 12, 310, 396, 9, SS_PATHELLIPSIS | SS_NOPREFIX
-    PUSHBUTTON      "閉じる", IDCANCEL, 350, 328, 58, 15
+    LTEXT           "", IDC_INIPATH, 12, 322, 396, 9, SS_PATHELLIPSIS | SS_NOPREFIX
+    PUSHBUTTON      "閉じる", IDCANCEL, 350, 340, 58, 15
 END
 
 // ------------------------------------------------------------------
@@ -109,8 +110,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 5,0,0,0
- PRODUCTVERSION 5,0,0,0
+ FILEVERSION 6,0,0,0
+ PRODUCTVERSION 6,0,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -120,9 +121,9 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "nekoryu"
             VALUE "FileDescription", "input-mouser - 1 組のキーボードとマウスで複数の PC を操作"
-            VALUE "FileVersion", "v5"
+            VALUE "FileVersion", "v6"
             VALUE "ProductName", "input-mouser"
-            VALUE "ProductVersion", "v5"
+            VALUE "ProductVersion", "v6"
             VALUE "Comments", "画面の端を越えると、LAN でつながった隣の PC を操作できます"
             VALUE "OriginalFilename", "input-mouser.exe"
         END

@@ -38,7 +38,7 @@
 #include <shellapi.h>
 
 #define APP_NAME     L"input-mouser"
-#define APP_VERSION  L"v5"      /* リリースのタグ(vN)と同じ。表示はこのまま */
+#define APP_VERSION  L"v6"      /* リリースのタグ(vN)と同じ。表示はこのまま */
 
 #define DEFAULT_PORT 31860
 #define PEER_MAX     8          /* 登録できる相手の数 */
@@ -83,6 +83,7 @@ typedef struct {
     Hotkey hkHome;          /* このPC に戻る */
     Hotkey hkLock;          /* 切り替えを固定する(入/切) */
     BOOL   admin;           /* 管理者として動かす(管理者のウィンドウも操作できるように) */
+    int    drawCursor;      /* マウスのない PC でカーソルを描く 0 / 1(Windows が描かないとき) / 2(いつも) */
     BOOL   osd;             /* 切り替えたとき画面に小さく知らせる(ini のみ) */
     BOOL   log;
     int    theme;           /* 0 = システム / 1 = ライト / 2 = ダーク(ini のみ) */
@@ -110,6 +111,7 @@ extern BOOL      g_elevated;            /* 管理者として動いている */
 #define WM_APP_CLIPRECV  (WM_APP + 5)   /* wp = 接続 ID, lp = ClipData* */
 #define WM_APP_CLIPSEND  (WM_APP + 6)   /* wp = 接続 ID。変わっていれば送る */
 #define WM_APP_FOUND     (WM_APP + 7)   /* 探索の応答(探索を頼んだ窓へ) lp = Found* */
+#define WM_APP_CURSOR    (WM_APP + 8)   /* 自分で描くカーソルを動かす(cursor.c) */
 
 #define CMD_SETTINGS     1
 #define CMD_EXIT         2
@@ -118,6 +120,13 @@ extern BOOL      g_elevated;            /* 管理者として動いている */
 void log_printf(const WCHAR *fmt, ...);
 void tray_update(void);
 BOOL app_relaunch_elevated(const WCHAR *extra);
+
+/* cursor.c(マウスのない PC でカーソルを自分で描く) */
+extern volatile LONG g_drawCursor;
+void cursor_follow(POINT p);        /* net スレッドから */
+void cursor_hide(void);
+void cursor_log_state(void);
+void cursor_apply(void);            /* UI スレッド(WM_APP_CURSOR) */
 
 /* firewall.c(Windows ファイアウォールの input-mouser の許可を消す) */
 extern WCHAR g_fwPrefix[32];

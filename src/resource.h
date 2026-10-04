@@ -32,6 +32,7 @@
 #define IDC_INIPATH        1032
 #define IDC_HINT_SWITCH    1033
 #define IDC_HINT_ADMIN     1034
+#define IDC_DRAWCUR        1035
 
 /* 相手の PC */
 #define IDC_HOST           1100

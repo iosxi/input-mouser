@@ -268,6 +268,10 @@ static LRESULT CALLBACK tray_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         clip_send_if_changed((int)wp);
         return 0;
 
+    case WM_APP_CURSOR:
+        cursor_apply();
+        return 0;
+
     case WM_COMMAND: {
         UINT id = LOWORD(wp);
         if (id >= IDM_PEER0 && id < IDM_PEER0 + PEER_MAX) { hook_switch((int)(id - IDM_PEER0)); return 0; }

@@ -193,13 +193,15 @@ void inj_enter(int conn, int side, int pos)
     g_edgeOut = FALSE;
     p = screen_entry(side, pos);
     move_abs(p);
+    cursor_follow(p);
+    cursor_log_state();
     if (g_dryRun) log_printf(L"[dryrun] enter side=%d pos=%d -> (%d,%d)", side, pos, p.x, p.y);
 }
 
 void inj_leave(int conn)
 {
     if (g_dryRun) log_printf(L"[dryrun] leave");
-    if (conn == g_active) g_active = -1;
+    if (conn == g_active) { g_active = -1; cursor_hide(); }
 }
 
 void inj_move(int conn, int dx, int dy)
@@ -211,6 +213,7 @@ void inj_move(int conn, int dx, int dy)
     t.y = cur.y + dy;
     side = screen_step(cur, t, &np, &pos, &corner);
     if (np.x != cur.x || np.y != cur.y) move_abs(np);
+    if (conn == g_active) cursor_follow(np);
     if (g_dryRun) log_printf(L"[dryrun] move %d,%d -> (%d,%d)%s", dx, dy, np.x, np.y,
                              side != SIDE_NONE ? L" edge" : L"");
     if (side != SIDE_NONE) {
@@ -311,5 +314,5 @@ void inj_release_all(void)
 void inj_conn_closed(int conn)
 {
     if (conn == g_active || g_active < 0) inj_release_all();
-    if (conn == g_active) g_active = -1;
+    if (conn == g_active) { g_active = -1; cursor_hide(); }
 }

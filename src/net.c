@@ -1026,6 +1026,7 @@ static void apply_config(Config *nc, BOOL first)
     int  i;
 
     g_nc = *nc;
+    InterlockedExchange(&g_drawCursor, nc->drawCursor);
     if (keyChanged) {
         if (g_nc.haveKey) CopyMemory(g_key, g_nc.key, 32);
         else              crypto_derive(L"", g_key);
