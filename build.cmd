@@ -16,7 +16,7 @@ echo.> build\empty.c
 gcc -c build\empty.c -o build\default-manifest.o || exit /b 1
 windres -I src src\input-mouser.rc -O coff -o build\input-mouser.res.o || exit /b 1
 
-set "SRC=src\main.c src\config.c src\crypto.c src\net.c src\hook.c src\inject.c src\clip.c src\theme.c src\ui_common.c src\ui_main.c src\ui_layout.c src\ui_peer.c src\firewall.c src\cursor.c"
+set "SRC=src\main.c src\config.c src\crypto.c src\net.c src\hook.c src\inject.c src\clip.c src\theme.c src\ui_common.c src\ui_main.c src\ui_layout.c src\ui_peer.c src\firewall.c src\cursor.c src\filecopy.c"
 set "LIBS=-luser32 -lgdi32 -lshell32 -lcomctl32 -ldwmapi -luxtheme -lshlwapi -lole32 -luuid -lws2_32 -liphlpapi -lbcrypt -lwtsapi32 -limm32 -loleaut32"
 set "WARN=-Wall -Wextra -Wno-cast-function-type -Wno-missing-field-initializers"
 

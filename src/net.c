@@ -18,6 +18,12 @@
  *  以後は本体が AES-256-GCM の暗号文 + tag 16 バイト(crypto.c)。
  *  平文の 1 バイト目が種類(M_*)。
  *
+ *  ファイルの接続(v11。ファイルのコピー＆貼り付けの中身を運ぶ 2 本目の TCP)
+ *      入力の接続と同じポート・同じ向き(操作する側から)・同じ握手で張る。
+ *      挨拶だけ "IMSF" で、乱数M の後に相棒の入力の接続の乱数M[16] を付ける。
+ *      受け手はそれで相棒を見つけ、見つからなければ断る。
+ *      大きな中身を入力の接続で運ぶと、その間マウスの動きが待たされるので分ける。
+ *
  *  探索(UDP、TCP と同じポート番号)
  *      "IMSR?" 版                         → ブロードキャスト
  *      "IMSR!" 版 ポート[u16] 名前の長さ 名前  ← 受け付けている PC が返す
@@ -95,7 +101,7 @@ static void set_status(int peer, int st)
 /*  ほかのスレッドからの待ち行列                                        */
 /* ------------------------------------------------------------------ */
 
-enum { Q_SEND, Q_CONFIG, Q_SOCKET, Q_DISCOVER, Q_RECONNECT, Q_STOP };
+enum { Q_SEND, Q_CONFIG, Q_SOCKET, Q_DISCOVER, Q_RECONNECT, Q_STOP, Q_FILEOPEN, Q_FSOCKET };
 
 typedef struct QMsg {
     struct QMsg *next;
@@ -199,6 +205,14 @@ void net_reconnect_now(void)
 {
     QMsg *m = q_new(Q_RECONNECT);
     if (m) q_push(m);
+}
+
+void net_file_open(int peer)
+{
+    QMsg *m = q_new(Q_FILEOPEN);
+    if (!m) return;
+    m->conn = peer;
+    q_push(m);
 }
 
 /* ------------------------------------------------------------------ */
@@ -454,6 +468,7 @@ static DWORD WINAPI connector_thread(LPVOID arg)
 /* ------------------------------------------------------------------ */
 
 enum { CS_HELLO, CS_PROOF, CS_READY };
+enum { CK_MAIN, CK_FILE };
 
 typedef struct {
     SOCKET   s;
@@ -470,11 +485,15 @@ typedef struct {
     WCHAR    addr[64];
     BOOL     dead;
     int      endStatus;     /* 閉じたときの相手の状態(out) */
+    int      kind;          /* CK_MAIN = 入力、CK_FILE = ファイル */
+    int      link;          /* 相棒の接続 ID(入力⇔ファイル)。なければ -1 */
+    BYTE     parent[16];    /* ファイルの接続: 相棒の入力の接続の乱数M */
 } Conn;
 
-#define CONN_MAX (PEER_MAX + INCOMING_MAX)
+#define CONN_MAX ((PEER_MAX + INCOMING_MAX) * 2)
 
 static Conn   *g_conns[CONN_MAX];
+static void    open_file_conn(int peer);
 static int     g_nextInId = CONN_IN_BASE;
 static Config  g_nc;                /* このスレッドが使う設定の写し */
 static BYTE    g_key[32];
@@ -487,22 +506,69 @@ static WCHAR   g_listenBind[64];
 
 static SRWLOCK g_namesLock = SRWLOCK_INIT;
 static WCHAR   g_inNames[512];
+static int     g_inIds[INCOMING_MAX];
+static int     g_nInIds;
+static BOOL    g_fileOpening[PEER_MAX];
+
+/* 入力の接続 → ファイルの接続(ほかのスレッドが引く) */
+static SRWLOCK g_linkLock = SRWLOCK_INIT;
+static struct { int main, file; } g_links[CONN_MAX];
+static int     g_nLinks;
 
 static void update_in_names(void)
 {
     WCHAR buf[512];
     int   i;
+    int   ids[INCOMING_MAX], nid = 0;
     buf[0] = 0;
     for (i = 0; i < CONN_MAX; i++) {
         Conn *c = g_conns[i];
-        if (!c || c->out || c->state != CS_READY) continue;
+        if (!c || c->out || c->state != CS_READY || c->kind != CK_MAIN) continue;
+        if (nid < INCOMING_MAX) ids[nid++] = c->id;
         if (buf[0] && lstrlenW(buf) + 2 < (int)ARRAYSIZE(buf)) lstrcatW(buf, L"、");
         if (lstrlenW(buf) + lstrlenW(c->name) + 1 < (int)ARRAYSIZE(buf)) lstrcatW(buf, c->name);
     }
     AcquireSRWLockExclusive(&g_namesLock);
     lstrcpyW(g_inNames, buf);
+    CopyMemory(g_inIds, ids, sizeof(int) * nid);
+    g_nInIds = nid;
     ReleaseSRWLockExclusive(&g_namesLock);
     if (g_trayWnd) PostMessageW(g_trayWnd, WM_APP_STATUS, 0, 0);
+}
+
+int net_in_main_ids(int *ids, int max)
+{
+    int n;
+    AcquireSRWLockShared(&g_namesLock);
+    n = min(max, g_nInIds);
+    CopyMemory(ids, g_inIds, sizeof(int) * n);
+    ReleaseSRWLockShared(&g_namesLock);
+    return n;
+}
+
+/* 入力とファイルの接続の組を、ほかのスレッドから引けるように書き出す */
+static void links_publish(void)
+{
+    int i;
+    AcquireSRWLockExclusive(&g_linkLock);
+    g_nLinks = 0;
+    for (i = 0; i < CONN_MAX; i++) {
+        Conn *c = g_conns[i];
+        if (!c || c->kind != CK_FILE || c->state != CS_READY || c->link < 0 || c->dead) continue;
+        g_links[g_nLinks].main = c->link;
+        g_links[g_nLinks].file = c->id;
+        g_nLinks++;
+    }
+    ReleaseSRWLockExclusive(&g_linkLock);
+}
+
+int net_file_conn(int mainConn)
+{
+    int i, r = -1;
+    AcquireSRWLockShared(&g_linkLock);
+    for (i = 0; i < g_nLinks; i++) if (g_links[i].main == mainConn) { r = g_links[i].file; break; }
+    ReleaseSRWLockShared(&g_linkLock);
+    return r;
 }
 
 int net_incoming_names(WCHAR *buf, int cch)
@@ -574,6 +640,7 @@ static int hello(BYTE *out, const char *magic, const BYTE nonce[16], const BYTE 
     out[n++] = PROTO_VER;
     CopyMemory(out + n, nonce, 16); n += 16;
     if (proof) { CopyMemory(out + n, proof, 32); n += 32; }
+    else if (!memcmp(magic, "IMSF", 4)) { CopyMemory(out + n, nonce + 16, 16); n += 16; }    /* 相棒の乱数M */
     nl = WideCharToMultiByte(CP_UTF8, 0, g_hostName, -1, name, sizeof(name), NULL, NULL) - 1;
     if (nl < 0) nl = 0;
     if (nl > 200) nl = 200;
@@ -602,7 +669,13 @@ static void session_keys(Conn *c)
     SecureZeroMemory(k, sizeof(k));
 }
 
-static Conn *conn_new(SOCKET s, BOOL out, int peer)
+static Conn *conn_find_main(int id)
+{
+    Conn *c = conn_find(id);
+    return c && c->kind == CK_MAIN ? c : NULL;
+}
+
+static Conn *conn_new(SOCKET s, BOOL out, int peer, int kind)
 {
     int   i;
     Conn *c;
@@ -617,7 +690,9 @@ static Conn *conn_new(SOCKET s, BOOL out, int peer)
     c->ev    = WSACreateEvent();
     c->out   = out;
     c->peer  = out ? peer : -1;
-    c->id    = out ? peer : g_nextInId++;
+    c->kind  = kind;
+    c->link  = -1;
+    c->id    = out && kind == CK_MAIN ? peer : g_nextInId++;
     c->state = CS_HELLO;
     c->since = c->lastRx = c->lastPing = GetTickCount();
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
@@ -634,10 +709,20 @@ static Conn *conn_new(SOCKET s, BOOL out, int peer)
     g_conns[i] = c;
 
     if (out) {
-        BYTE h[HS_MAX];
+        BYTE h[HS_MAX], nn[32];
         crypto_random(c->nM, 16);
-        conn_raw(c, h, hello(h, "IMSR", c->nM, NULL));
         lstrcpynW(c->name, g_nc.peers[peer].host, HOST_MAX);
+        if (kind == CK_FILE) {
+            Conn *m = conn_find_main(peer);
+            if (!m || m->state != CS_READY) { c->dead = TRUE; return c; }
+            CopyMemory(c->parent, m->nM, 16);
+            c->link = m->id;
+            CopyMemory(nn, c->nM, 16);
+            CopyMemory(nn + 16, c->parent, 16);
+            conn_raw(c, h, hello(h, "IMSF", nn, NULL));
+        } else {
+            conn_raw(c, h, hello(h, "IMSR", c->nM, NULL));
+        }
     }
     return c;
 }
@@ -657,6 +742,20 @@ static void conn_close(int slot)
     buf_free(&c->in);
     buf_free(&c->ob);
 
+    if (c->kind == CK_FILE) {               /* ファイルの接続 */
+        Conn *m = conn_find(c->link);
+        if (m && m->link == c->id) m->link = -1;
+        if (c->out && c->peer >= 0 && c->peer < PEER_MAX) g_fileOpening[c->peer] = FALSE;
+        if (wasReady) log_printf(L"%s とのファイルの接続を閉じました", c->name);
+        filecopy_conn_closed(c->id);
+        links_publish();
+        mem_free(c);
+        return;
+    }
+    if (c->link >= 0) {                     /* 相棒のファイルの接続も閉じる */
+        Conn *f = conn_find(c->link);
+        if (f) f->dead = TRUE;
+    }
     if (c->out) {
         if (wasReady) log_printf(L"%s との接続が切れました", c->name);
         set_status(c->peer, c->endStatus ? c->endStatus : PS_OFF);
@@ -709,16 +808,40 @@ static void on_handshake(Conn *c, const BYTE *p, int n)
         conn_raw(c, proof, 32);
         session_keys(c);
         c->state = CS_READY;
+        if (c->kind == CK_FILE) {
+            Conn *m = conn_find_main(c->link);
+            if (m) m->link = c->id;
+            g_fileOpening[c->peer] = FALSE;
+            log_printf(L"%s へファイルの接続を張りました", c->name);
+            links_publish();
+            return;
+        }
         log_printf(L"%s (%s) につながりました", c->name, c->addr);
         set_status(c->peer, PS_READY);
         return;
     }
 
     if (c->state == CS_HELLO) {                     /* マスターの挨拶 */
-        if (n < 4 + 1 + 16 + 1 || memcmp(p, "IMSR", 4)) { c->dead = TRUE; return; }
+        int nameAt = 21;
+        if (n < 4 + 1 + 16 + 1 || (memcmp(p, "IMSR", 4) && memcmp(p, "IMSF", 4))) { c->dead = TRUE; return; }
         if (p[4] != PROTO_VER) { c->dead = TRUE; return; }
         CopyMemory(c->nM, p + 5, 16);
-        read_name(p + 21, n - 21, c->name);
+        if (!memcmp(p, "IMSF", 4)) {                /* ファイルの接続。相棒の入力の接続を探す */
+            int i;
+            if (n < 4 + 1 + 16 + 16 + 1) { c->dead = TRUE; return; }
+            c->kind = CK_FILE;
+            CopyMemory(c->parent, p + 21, 16);
+            nameAt = 37;
+            for (i = 0; i < CONN_MAX; i++) {
+                Conn *m = g_conns[i];
+                if (m && !m->out && m->kind == CK_MAIN && m->state == CS_READY && !memcmp(m->nM, c->parent, 16)) {
+                    c->link = m->id;
+                    break;
+                }
+            }
+            if (c->link < 0) { c->dead = TRUE; return; }    /* 相棒がいない */
+        }
+        read_name(p + nameAt, n - nameAt, c->name);
         if (!c->name[0]) lstrcpynW(c->name, c->addr, HOST_MAX);
         crypto_random(c->nS, 16);
         crypto_hmac(g_key, "S", 1, c->nM, 16, c->nS, 16, proof);
@@ -735,6 +858,13 @@ static void on_handshake(Conn *c, const BYTE *p, int n)
     }
     session_keys(c);
     c->state = CS_READY;
+    if (c->kind == CK_FILE) {
+        Conn *m = conn_find_main(c->link);
+        if (!m) { c->dead = TRUE; return; }
+        m->link = c->id;
+        links_publish();
+        return;
+    }
     log_printf(L"%s (%s) から操作できるようになりました", c->name, c->addr);
     update_in_names();
 }
@@ -744,6 +874,21 @@ static void on_message(Conn *c, const BYTE *p, int n)
     BYTE type = p[0];
     p++; n--;
 
+    if (c->kind == CK_FILE) {               /* ファイルの接続(どちら向きも同じ) */
+        switch (type) {
+        case M_FREAD: filecopy_request(c->id, c->link, p, n); break;
+        case M_FDATA: filecopy_deliver(c->id, p, n); break;
+        case M_PING:  if (!c->out) conn_msg(c, M_PONG, NULL, 0); break;
+        }
+        return;
+    }
+    if (type == M_FILES) {                  /* 相手がファイルをコピーしてある */
+        if (g_nc.clipboard) {
+            filecopy_offer_received(c->id, p, n);
+            if (c->out) open_file_conn(c->peer);
+        }
+        return;
+    }
     if (c->out) {
         switch (type) {
         case M_EDGE:
@@ -769,6 +914,62 @@ static void on_message(Conn *c, const BYTE *p, int n)
     case M_CLIP:    post_clip(c->id, p, n); break;
     case M_PING:    conn_msg(c, M_PONG, NULL, 0); break;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/*  ファイルの接続を張る(こちらが操作する側)                            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int    peer;
+    struct sockaddr_storage ss;
+    int    sl;
+} FOpen;
+
+static DWORD WINAPI fopen_thread(LPVOID arg)
+{
+    FOpen *f = (FOpen *)arg;
+    SOCKET s = socket(f->ss.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    QMsg  *m;
+    if (s != INVALID_SOCKET) {
+        u_long nb = 1;
+        int    ok = 0, err = 0, el = sizeof(err);
+        ioctlsocket(s, FIONBIO, &nb);
+        if (connect(s, (struct sockaddr *)&f->ss, f->sl) == 0) ok = 1;
+        else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set w, e;
+            struct timeval tv = { 3, 0 };
+            FD_ZERO(&w); FD_ZERO(&e); FD_SET(s, &w); FD_SET(s, &e);
+            if (select(0, NULL, &w, &e, &tv) > 0 && FD_ISSET(s, &w) &&
+                getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &el) == 0 && !err) ok = 1;
+        }
+        if (!ok) { closesocket(s); s = INVALID_SOCKET; }
+    }
+    m = q_new(Q_FSOCKET);
+    if (m) { m->conn = f->peer; m->arg = (LONG_PTR)s; q_push(m); }
+    else if (s != INVALID_SOCKET) closesocket(s);
+    mem_free(f);
+    return 0;
+}
+
+/* 入力の接続と同じ相手・同じポートへ(名前を引き直さない) */
+static void open_file_conn(int peer)
+{
+    Conn  *m;
+    FOpen *f;
+    HANDLE th;
+    if (peer < 0 || peer >= PEER_MAX || g_fileOpening[peer]) return;
+    m = conn_find_main(peer);
+    if (!m || !m->out || m->state != CS_READY || m->link >= 0) return;
+    f = (FOpen *)mem_alloc(sizeof(FOpen));
+    if (!f) return;
+    f->peer = peer;
+    f->sl   = sizeof(f->ss);
+    if (getpeername(m->s, (struct sockaddr *)&f->ss, &f->sl) != 0) { mem_free(f); return; }
+    g_fileOpening[peer] = TRUE;
+    th = CreateThread(NULL, 64 * 1024, fopen_thread, f, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (th) CloseHandle(th);
+    else { g_fileOpening[peer] = FALSE; mem_free(f); }
 }
 
 static void conn_read(Conn *c)
@@ -897,8 +1098,8 @@ static void on_accept(void)
         SOCKET s = accept(g_listen, NULL, NULL);
         if (s == INVALID_SOCKET) break;
         for (i = 0, nin = 0; i < CONN_MAX; i++) if (g_conns[i] && !g_conns[i]->out) nin++;
-        if (nin >= INCOMING_MAX) { closesocket(s); continue; }
-        conn_new(s, FALSE, -1);
+        if (nin >= INCOMING_MAX * 2) { closesocket(s); continue; }      /* 入力とファイルで 2 本ずつ */
+        conn_new(s, FALSE, -1, CK_MAIN);        /* ファイルの接続なら挨拶で分かる */
     }
 }
 
@@ -1097,9 +1298,23 @@ static DWORD WINAPI net_thread(LPVOID arg)
                 break;
             case Q_SOCKET:
                 if (m->conn < g_nc.npeers && m->len == (int)g_gen[m->conn] && g_connectors[m->conn])
-                    conn_new((SOCKET)m->arg, TRUE, m->conn);
+                    conn_new((SOCKET)m->arg, TRUE, m->conn, CK_MAIN);
                 else
                     closesocket((SOCKET)m->arg);
+                break;
+            case Q_FILEOPEN:
+                open_file_conn(m->conn);
+                break;
+            case Q_FSOCKET:
+                if ((SOCKET)m->arg == INVALID_SOCKET) {
+                    if (m->conn >= 0 && m->conn < PEER_MAX) g_fileOpening[m->conn] = FALSE;
+                    log_printf(L"ファイルの接続を張れませんでした");
+                } else if (conn_find_main(m->conn)) {
+                    conn_new((SOCKET)m->arg, TRUE, m->conn, CK_FILE);
+                } else {
+                    closesocket((SOCKET)m->arg);
+                    g_fileOpening[m->conn] = FALSE;
+                }
                 break;
             case Q_DISCOVER:
                 start_discover((HWND)m->arg);

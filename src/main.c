@@ -20,6 +20,8 @@
  *  input-mouser.exe -nohook         フックを掛けない(画面の確認で、切り替わらないように)
  *  input-mouser.exe -name <名前>    この名前で名乗る(名前で引けない相手への接続を確かめる)
  *  input-mouser.exe -fwprefix <s>   -fwremove で消す規則の名前の先頭を変える(本物の規則を消さずに確かめる)
+ *  input-mouser.exe -clipsend <n>   動いている input-mouser にクリップボードを送らせる(切り替えずに)。
+ *                                   1.. = 登録した順の相手へ、0 = つながっているマスターすべてへ
  *
  *  多重起動の判定は設定ファイルごと。-ini で別の設定を指定すれば
  *  並べて動かせる(検証用)。
@@ -233,6 +235,13 @@ static LRESULT CALLBACK tray_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         switch (wp) {
         case CMD_SETTINGS: ui_open_main(); break;
         case CMD_SWITCH:   hook_switch((int)lp - 1); break;
+        case CMD_CLIPSEND:
+            if (lp > 0) clip_force_send((int)lp - 1);
+            else {
+                int ids[INCOMING_MAX], k, n = net_in_main_ids(ids, INCOMING_MAX);
+                for (k = 0; k < n; k++) clip_force_send(ids[k]);
+            }
+            break;
         case CMD_EXIT:     DestroyWindow(h); break;
         }
         return 0;
@@ -270,6 +279,10 @@ static LRESULT CALLBACK tray_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_CURSOR:
         cursor_apply();
+        return 0;
+
+    case WM_APP_CLIPMARK:
+        clip_mark_synced((int)wp, (DWORD)lp);
         return 0;
 
     case WM_COMMAND: {
@@ -401,6 +414,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         else if (!lstrcmpiW(a, L"name") && i + 1 < argc) lstrcpynW(fakeName, argv[++i], HOST_MAX);
         else if (!lstrcmpiW(a, L"wait") && i + 1 < argc) waitPid = (DWORD)StrToIntW(argv[++i]);
         else if (!lstrcmpiW(a, L"bind") && i + 1 < argc) lstrcpynW(g_bindAddr, argv[++i], 64);
+        else if (!lstrcmpiW(a, L"clipsend") && i + 1 < argc) { cmd = CMD_CLIPSEND; cmdArg = StrToIntW(argv[++i]); }
         else if (!lstrcmpiW(a, L"switch") && i + 1 < argc) {
             const WCHAR *v = argv[++i];
             cmd    = CMD_SWITCH;
@@ -520,6 +534,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 
     hook_stop();
     net_stop();
+    filecopy_stop();
     mousekeys_end();                /* 接続を閉じるときに戻しているが、念のため */
     log_printf(L"input-mouser 終了");
     CoUninitialize();

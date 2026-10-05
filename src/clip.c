@@ -33,6 +33,21 @@ static DWORD *sent_slot(int conn, BOOL create)
     return &g_sent[free_].seq;
 }
 
+/* 相手から受け取った内容をクリップボードに置いた。その相手には送り返さない */
+void clip_mark_synced(int conn, DWORD seq)
+{
+    DWORD *slot = sent_slot(conn, TRUE);
+    *slot = seq;
+}
+
+/* 検証用: 変わっていなくても送る */
+void clip_force_send(int conn)
+{
+    DWORD *slot = sent_slot(conn, TRUE);
+    *slot = 0;
+    clip_send_if_changed(conn);
+}
+
 void clip_conn_closed(int conn)
 {
     int i;
@@ -67,6 +82,20 @@ void clip_send_if_changed(int conn)
     if (*slot == seq) return;
     *slot = seq;
     if (!open_clipboard()) return;
+
+    /* エクスプローラーでコピーしたファイル。一覧だけ送り、中身は貼り付けたときに(filecopy.c) */
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        HDROP hd = (HDROP)GetClipboardData(CF_HDROP);
+        BYTE *msg = NULL;
+        int   mlen = 0;
+        BOOL  ok = hd && filecopy_make_offer(conn, hd, &msg, &mlen);
+        CloseClipboard();
+        if (ok) {
+            net_send_owned(conn, M_FILES, msg, mlen);
+            if (conn < CONN_IN_BASE) net_file_open(conn);     /* こちらが操作する側。先に張っておく */
+        }
+        return;
+    }
 
     if (IsClipboardFormatAvailable(CF_UNICODETEXT) && (ht = GetClipboardData(CF_UNICODETEXT)) != NULL) {
         const WCHAR *t = (const WCHAR *)GlobalLock(ht);

@@ -214,6 +214,23 @@
   `FindWindowEx(…, "Microsoft.UI.Content.PopupWindowSiteBridge", "PopupHost")` で数える）。
   メニューは `SysListView32`（Progman の下の SHELLDLL_DefView の子）に `WM_CONTEXTMENU` を送ると開く。
 
+### ファイルのコピー＆貼り付け（v11）
+
+- `filecopy.c`。コピーした側は CF_HDROP から一覧（相対パス・大きさ・日時・属性。フォルダは中まで）を作って
+  `M_FILES` を入力の接続で送り、「申し出」として最新 4 つを覚える。貼り付ける側は専用の STA スレッドで
+  `OleSetClipboard` に `CFSTR_FILEDESCRIPTORW` / `CFSTR_FILECONTENTS`（`IStream`）のデータ オブジェクトを置く。
+  `IStream::Read` で `M_FREAD`（512KB ずつ、6 つ先読み）を送り、`M_FDATA` を待つ。読み出しは専用スレッド。
+- 中身はファイルの接続（2 本目の TCP、挨拶 "IMSF" ＋相棒の入力の接続の乱数M）。操作する側から、入力の接続の
+  `getpeername` と同じ宛先へ張る（名前を引き直さない）。一覧を送るとき・受けたときに張る。
+  申し出は、送った相手の入力の接続に結び付いたファイルの接続からの読み出しにしか応えない。
+- 検証: A（`accept=0`、相手 127.0.0.1:31861）と B（`accept=1`）を `-bind 127.0.0.1 -nohook` で動かし、
+  `-clipsend` で送らせる（切り替えないのでフックは要らない。B は dryrun にしない＝本物のクリップボードを使う）。
+  貼り付けは PowerShell（`-STA`）から `Shell.Application` の `Namespace(dest).Self.InvokeVerb("Paste")`。
+  **同じ PC なのでクリップボードが置き換わる。** 文字だけは保存して戻す。
+- 実測（2026-10-05、127.0.0.1）: A→B・B→A とも 5 ファイル＋2 フォルダ（50MB・0 バイト・日本語名・入れ子）が
+  SHA-256 で一致。転送中の最大の専用メモリ 送る側 3.4MB・受ける側 7.3MB（待機中は 2.2MB）。exe 281KB（+18KB）。
+- **2 台の間（LAN 越し、本物のエクスプローラーでの貼り付け）はまだ確かめていない。**
+
 ### 確かめていないこと
 
 - 2 台の PC の間で実際に使うこと（LAN 越しの接続、探索のブロードキャスト、ファイアウォールの確認画面）。

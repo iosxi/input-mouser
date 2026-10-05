@@ -38,7 +38,7 @@
 #include <shellapi.h>
 
 #define APP_NAME     L"input-mouser"
-#define APP_VERSION  L"v10"      /* リリースのタグ(vN)と同じ。表示はこのまま */
+#define APP_VERSION  L"v11"      /* リリースのタグ(vN)と同じ。表示はこのまま */
 
 #define DEFAULT_PORT 31860
 #define PEER_MAX     8          /* 登録できる相手の数 */
@@ -112,10 +112,12 @@ extern BOOL      g_elevated;            /* 管理者として動いている */
 #define WM_APP_CLIPSEND  (WM_APP + 6)   /* wp = 接続 ID。変わっていれば送る */
 #define WM_APP_FOUND     (WM_APP + 7)   /* 探索の応答(探索を頼んだ窓へ) lp = Found* */
 #define WM_APP_CURSOR    (WM_APP + 8)   /* 自分で描くカーソルを動かす(cursor.c) */
+#define WM_APP_CLIPMARK  (WM_APP + 9)   /* wp = 接続 ID, lp = 置いたあとのクリップボードの番号(送り返さない) */
 
 #define CMD_SETTINGS     1
 #define CMD_EXIT         2
 #define CMD_SWITCH       3              /* lp = 0 はこのPC、1.. は相手の番号 */
+#define CMD_CLIPSEND     4              /* 検証用。lp = 1.. は相手へ、0 はつながっているマスターすべてへ */
 
 void log_printf(const WCHAR *fmt, ...);
 void tray_update(void);
@@ -188,7 +190,10 @@ enum {
     M_PING,         /* M→S */
     M_PONG,         /* S→M */
     M_EDGE,         /* S→M  u8 越えた辺(SIDE_NONE なら端を離れた) u16 位置 u16 角までの距離 */
-    M_RELEASE       /* M→S  押したままのキー・ボタンをすべて離す */
+    M_RELEASE,      /* M→S  押したままのキー・ボタンをすべて離す */
+    M_FILES,        /* 双方(入力の接続)  コピーしたファイルの一覧(filecopy.c の形式) */
+    M_FREAD,        /* 双方(ファイルの接続)  中身をください */
+    M_FDATA         /* 双方(ファイルの接続)  中身 */
 };
 #define IKF_UP       0x01
 #define IKF_EXT      0x02
@@ -217,6 +222,15 @@ void net_send_owned(int conn, BYTE type, void *heapData, int len);   /* data の
 void net_discover(HWND notify);
 int  net_incoming_names(WCHAR *buf, int cch);  /* 今つながっているマスターの名前 */
 void net_reconnect_now(void);
+int  net_file_conn(int mainConn);              /* その入力の接続の相棒のファイルの接続。なければ -1 */
+void net_file_open(int peer);                  /* 相手へファイルの接続を張る(まだなければ) */
+int  net_in_main_ids(int *ids, int max);       /* こちらへ来ているマスターの入力の接続 */
+
+/* 小さな読み書き(filecopy.c と共用) */
+static __inline UINT32 le32p(const BYTE *p)
+{ return (UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24); }
+static __inline void put32p(BYTE *p, UINT32 v)
+{ p[0] = (BYTE)v; p[1] = (BYTE)(v >> 8); p[2] = (BYTE)(v >> 16); p[3] = (BYTE)(v >> 24); }
 
 /* ------------------------------------------------------------------ */
 /*  hook.c(マスター側)                                                */
@@ -271,6 +285,19 @@ typedef struct {
 void clip_send_if_changed(int conn);
 void clip_received(int conn, ClipData *cd);
 void clip_conn_closed(int conn);
+void clip_mark_synced(int conn, DWORD seq);
+void clip_force_send(int conn);
+
+/* ------------------------------------------------------------------ */
+/*  filecopy.c(ファイルのコピー＆貼り付け)                            */
+/* ------------------------------------------------------------------ */
+
+BOOL filecopy_make_offer(int mainConn, HDROP hd, BYTE **out, int *outLen);
+void filecopy_request(int fileConn, int mainConn, const BYTE *p, int n);   /* net スレッドから */
+void filecopy_deliver(int fileConn, const BYTE *p, int n);
+void filecopy_conn_closed(int fileConn);
+void filecopy_offer_received(int mainConn, const BYTE *p, int n);
+void filecopy_stop(void);
 
 /* ------------------------------------------------------------------ */
 /*  theme.c                                                            */
