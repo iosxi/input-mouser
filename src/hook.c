@@ -57,6 +57,18 @@ static DWORD   g_edgeSince;
 #define HM_ACTION  (WM_APP + 105)   /* wp = ホットキーの働き */
 #define HM_QUIT    (WM_APP + 106)
 #define HM_FORCEHOME (WM_APP + 107) /* ロック・安全なデスクトップ。押したままのキーも離させる */
+#define HM_EDGELOG   (WM_APP + 108) /* 端を越えたのに切り替えなかった理由をログへ(フックの外で書く) */
+
+/* edge_push の結果 */
+enum { EP_SWITCHED = 1, EP_LOCKED = -1, EP_BUTTON = -2, EP_CORNER = -3, EP_NOPEER = -4,
+       EP_NOTREADY = -5, EP_WAIT = -6, EP_NOTEDGE = -7 };
+
+static struct {
+    int   reason, side, corner, peer, status;
+    POINT pt, cur;
+    BYTE  buttons[5];
+} g_edgeDbg;
+static DWORD g_edgeDbgAt;
 
 enum { ACT_NONE, ACT_HOME, ACT_LOCK, ACT_PEER0 };
 
@@ -210,16 +222,16 @@ static BOOL any_button(void)
     return FALSE;
 }
 
-/* 端を押した。切り替えたら TRUE */
-static BOOL edge_push(int src, int side, int pos, int corner)
+/* 端を押した。切り替えたら EP_SWITCHED、切り替えなかったら理由(EP_*、負) */
+static int edge_push(int src, int side, int pos, int corner)
 {
     static const int dx[4] = { -1, 1, 0, 0 }, dy[4] = { 0, 0, -1, 1 };
     static const int opposite[4] = { SIDE_RIGHT, SIDE_LEFT, SIDE_BOTTOM, SIDE_TOP };
     int nx, ny, dest;
 
-    if (side > SIDE_BOTTOM || g_locked) return FALSE;
-    if (g_hc.noDragSwitch && any_button()) return FALSE;
-    if (g_hc.corner > 0 && corner < g_hc.corner) { edge_clear(); return FALSE; }
+    if (side > SIDE_BOTTOM || g_locked) return EP_LOCKED;
+    if (g_hc.noDragSwitch && any_button()) return EP_BUTTON;
+    if (g_hc.corner > 0 && corner < g_hc.corner) { edge_clear(); return EP_CORNER; }
 
     nx = g_cellX + dx[side];
     ny = g_cellY + dy[side];
@@ -227,7 +239,8 @@ static BOOL edge_push(int src, int side, int pos, int corner)
         dest = -1;
     } else {
         dest = peer_at(&g_hc, nx, ny);
-        if (dest < 0 || g_peerStatus[dest] != PS_READY) return FALSE;
+        if (dest < 0) return EP_NOPEER;
+        if (g_peerStatus[dest] != PS_READY) return EP_NOTREADY;
     }
     if (g_hc.edgeDelay > 0) {
         DWORD now = GetTickCount();
@@ -235,12 +248,39 @@ static BOOL edge_push(int src, int side, int pos, int corner)
             g_edgeSrc   = src;
             g_edgeSide  = side;
             g_edgeSince = now;
-            return FALSE;
+            return EP_WAIT;
         }
-        if (now - g_edgeSince < (DWORD)g_hc.edgeDelay) return FALSE;
+        if (now - g_edgeSince < (DWORD)g_hc.edgeDelay) return EP_WAIT;
     }
     switch_to(dest, opposite[side], pos);
-    return TRUE;
+    return EP_SWITCHED;
+}
+
+/* 切り替えなかった理由を覚えて、フックの外で書かせる(0.25 秒に 1 回まで) */
+static void edge_note(int reason, int side, int corner, POINT pt, POINT cur)
+{
+    DWORD now;
+    if (!g_hc.log) return;
+    now = GetTickCount();
+    if (now - g_edgeDbgAt < 250) return;
+    g_edgeDbgAt = now;
+    g_edgeDbg.reason = reason;
+    g_edgeDbg.side   = side;
+    g_edgeDbg.corner = corner;
+    g_edgeDbg.pt     = pt;
+    g_edgeDbg.cur    = cur;
+    g_edgeDbg.peer   = -1;
+    g_edgeDbg.status = -1;
+    {
+        static const int dx[4] = { -1, 1, 0, 0 }, dy[4] = { 0, 0, -1, 1 };
+        if (side <= SIDE_BOTTOM) {
+            int p = peer_at(&g_hc, g_cellX + dx[side], g_cellY + dy[side]);
+            g_edgeDbg.peer = p;
+            if (p >= 0) g_edgeDbg.status = g_peerStatus[p];
+        }
+    }
+    CopyMemory(g_edgeDbg.buttons, g_btnDown, sizeof(g_btnDown));
+    PostThreadMessageW(g_tid, HM_EDGELOG, 0, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -286,8 +326,21 @@ static LRESULT CALLBACK mouse_proc(int code, WPARAM wp, LPARAM lp)
             int   pos = 0, corner = 0, side;
             if (g_locked) break;
             side = screen_step(cur, m->pt, &np, &pos, &corner);
-            if (side == SIDE_NONE) { if (g_edgeSrc == -1) edge_clear(); break; }
-            if (edge_push(-1, side, pos, corner)) return 1;
+            if (side == SIDE_NONE) {
+                if (g_edgeSrc == -1) edge_clear();
+                if (g_hc.log) {         /* 画面全体の外なのに端と判定しなかった */
+                    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                    if (m->pt.x < vx || m->pt.y < vy || m->pt.x >= vx + GetSystemMetrics(SM_CXVIRTUALSCREEN) ||
+                        m->pt.y >= vy + GetSystemMetrics(SM_CYVIRTUALSCREEN))
+                        edge_note(EP_NOTEDGE, SIDE_NONE, 0, m->pt, cur);
+                }
+                break;
+            }
+            {
+                int r = edge_push(-1, side, pos, corner);
+                if (r == EP_SWITCHED) return 1;
+                edge_note(r, side, corner, m->pt, cur);
+            }
             break;
         }
         if (m->pt.x != cur.x || m->pt.y != cur.y) send_move(t, m->pt.x - cur.x, m->pt.y - cur.y);
@@ -522,6 +575,21 @@ static DWORD WINAPI hook_thread(LPVOID arg)
             hooks_update();
             if (g_trayWnd) PostMessageW(g_trayWnd, WM_APP_STATUS, 0, 0);
             break;
+        case HM_EDGELOG: {
+            static const WCHAR *const reasons[] = { L"", L"固定中", L"ボタンが押されている扱い", L"角",
+                                                    L"その向きに相手がいない", L"相手につながっていない", L"押し続け待ち",
+                                                    L"画面の外なのに端と判定しなかった" };
+            static const WCHAR *const sides[] = { L"左", L"右", L"上", L"下" };
+            int r = -g_edgeDbg.reason;
+            log_printf(L"端を越えたが切り替えなかった: %s端、理由=%s、届いた座標(%d,%d)、カーソル(%d,%d)、角まで %d、"
+                       L"相手=%d(状態 %d)、ボタン %d%d%d%d%d、位置(%d,%d)",
+                       g_edgeDbg.side <= SIDE_BOTTOM ? sides[g_edgeDbg.side] : L"?",
+                       r >= 1 && r <= 7 ? reasons[r] : L"?", g_edgeDbg.pt.x, g_edgeDbg.pt.y,
+                       g_edgeDbg.cur.x, g_edgeDbg.cur.y, g_edgeDbg.corner, g_edgeDbg.peer, g_edgeDbg.status,
+                       g_edgeDbg.buttons[0], g_edgeDbg.buttons[1], g_edgeDbg.buttons[2], g_edgeDbg.buttons[3],
+                       g_edgeDbg.buttons[4], g_cellX, g_cellY);
+            break;
+        }
         case HM_FORCEHOME:
             force_home();
             break;
