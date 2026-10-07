@@ -12,9 +12,12 @@
  *  通信の形
  *      [u32 長さ][本体]            長さはリトル エンディアン
  *  握手(平文)
- *      M→S  "IMSR" 版 乱数M[16] 名前の長さ 名前(UTF-8)
- *      S→M  "IMSR" 版 乱数S[16] 確認S[32] 名前の長さ 名前
+ *      M→S  "IMSR" 版 乱数M[16] 名前の長さ 名前(UTF-8) 能力[u32]
+ *      S→M  "IMSR" 版 乱数S[16] 確認S[32] 名前の長さ 名前 能力[u32]
  *      M→S  確認M[32]
+ *  版(PROTO_VER)が違えば断る。受け手は断る前に自分の版を返すので、操作する側に「版が合いません」と出る。
+ *  能力(CAP_*。v13 から)は名前の後ろに付ける。互換を保てる追加は版を上げず、能力のビットを足す
+ *  (相手が出していなければ使わない)。名前の後ろが足りなければ能力は 0。
  *  以後は本体が AES-256-GCM の暗号文 + tag 16 バイト(crypto.c)。
  *  平文の 1 バイト目が種類(M_*)。
  *
@@ -34,7 +37,7 @@
 
 volatile LONG g_peerStatus[PEER_MAX];
 
-#define PROTO_VER  1
+#define PROTO_VER  2             /* v13 で 2(能力の印を足した)。v12 までとはつながらない */
 #define HS_MAX     512
 #define PING_MS    2000
 #define DEAD_MS    7000
@@ -488,6 +491,8 @@ typedef struct {
     int      kind;          /* CK_MAIN = 入力、CK_FILE = ファイル */
     int      link;          /* 相棒の接続 ID(入力⇔ファイル)。なければ -1 */
     BYTE     parent[16];    /* ファイルの接続: 相棒の入力の接続の乱数M */
+    UINT32   caps;          /* 相手の能力の印(CAP_*) */
+    BOOL     peerClosed;    /* 相手が閉じた(こちらが切ったのではない) */
 } Conn;
 
 #define CONN_MAX ((PEER_MAX + INCOMING_MAX) * 2)
@@ -509,10 +514,11 @@ static WCHAR   g_inNames[512];
 static int     g_inIds[INCOMING_MAX];
 static int     g_nInIds;
 static BOOL    g_fileOpening[PEER_MAX];
+static BOOL    g_warnedSilent[PEER_MAX];    /* 「挨拶に答えずに切られた」をログに出した */
 
 /* 入力の接続 → ファイルの接続(ほかのスレッドが引く) */
 static SRWLOCK g_linkLock = SRWLOCK_INIT;
-static struct { int main, file; } g_links[CONN_MAX];
+static struct { int main, file; UINT32 caps; } g_links[CONN_MAX];
 static int     g_nLinks;
 
 static void update_in_names(void)
@@ -557,6 +563,7 @@ static void links_publish(void)
         if (!c || c->kind != CK_FILE || c->state != CS_READY || c->link < 0 || c->dead) continue;
         g_links[g_nLinks].main = c->link;
         g_links[g_nLinks].file = c->id;
+        g_links[g_nLinks].caps = c->caps;
         g_nLinks++;
     }
     ReleaseSRWLockExclusive(&g_linkLock);
@@ -567,6 +574,16 @@ int net_file_conn(int mainConn)
     int i, r = -1;
     AcquireSRWLockShared(&g_linkLock);
     for (i = 0; i < g_nLinks; i++) if (g_links[i].main == mainConn) { r = g_links[i].file; break; }
+    ReleaseSRWLockShared(&g_linkLock);
+    return r;
+}
+
+UINT32 net_file_caps(int fileConn)
+{
+    int    i;
+    UINT32 r = 0;
+    AcquireSRWLockShared(&g_linkLock);
+    for (i = 0; i < g_nLinks; i++) if (g_links[i].file == fileConn) { r = g_links[i].caps; break; }
     ReleaseSRWLockShared(&g_linkLock);
     return r;
 }
@@ -646,7 +663,16 @@ static int hello(BYTE *out, const char *magic, const BYTE nonce[16], const BYTE 
     if (nl > 200) nl = 200;
     out[n++] = (BYTE)nl;
     CopyMemory(out + n, name, nl);
-    return n + nl;
+    n += nl;
+    put32(out + n, CAP_ALL);
+    return n + 4;
+}
+
+/* 名前の後ろの能力の印(無ければ 0) */
+static UINT32 read_caps(const BYTE *p, int avail)
+{
+    int nl = avail > 0 ? p[0] : 0;
+    return avail >= 1 + nl + 4 ? le32(p + 1 + nl) : 0;
 }
 
 static void read_name(const BYTE *p, int avail, WCHAR *out)
@@ -758,6 +784,14 @@ static void conn_close(int slot)
     }
     if (c->out) {
         if (wasReady) log_printf(L"%s との接続が切れました", c->name);
+        if (c->state == CS_HELLO && c->peerClosed && !c->endStatus) {
+            /* 挨拶に答えずに切られた。v12 以前の受け手は、版が違うと黙って切る */
+            if (!g_warnedSilent[c->peer])
+                log_printf(L"%s: 挨拶に答えずに切られました。相手の input-mouser が古い(v12 以前で、版が合わない)"
+                           L"か、受け付けがいっぱいかもしれません", c->name);
+            g_warnedSilent[c->peer] = TRUE;
+            c->endStatus = PS_REFUSED;
+        }
         set_status(c->peer, c->endStatus ? c->endStatus : PS_OFF);
         hook_peer_down(c->peer);
         if (g_connectors[c->peer]) SetEvent(g_connectors[c->peer]->wake);
@@ -804,6 +838,7 @@ static void on_handshake(Conn *c, const BYTE *p, int n)
             c->dead = TRUE;
             return;
         }
+        c->caps = read_caps(p + 53, n - 53);
         crypto_hmac(g_key, "C", 1, c->nM, 16, c->nS, 16, proof);
         conn_raw(c, proof, 32);
         session_keys(c);
@@ -817,6 +852,7 @@ static void on_handshake(Conn *c, const BYTE *p, int n)
             return;
         }
         log_printf(L"%s (%s) につながりました", c->name, c->addr);
+        g_warnedSilent[c->peer] = FALSE;
         set_status(c->peer, PS_READY);
         return;
     }
@@ -824,7 +860,15 @@ static void on_handshake(Conn *c, const BYTE *p, int n)
     if (c->state == CS_HELLO) {                     /* マスターの挨拶 */
         int nameAt = 21;
         if (n < 4 + 1 + 16 + 1 || (memcmp(p, "IMSR", 4) && memcmp(p, "IMSF", 4))) { c->dead = TRUE; return; }
-        if (p[4] != PROTO_VER) { c->dead = TRUE; return; }
+        if (p[4] != PROTO_VER) {
+            BYTE zero[32];
+            ZeroMemory(zero, sizeof(zero));
+            crypto_random(c->nS, 16);
+            conn_raw(c, h, hello(h, "IMSR", c->nS, zero));      /* 版を知らせてから閉じる(確認は 0) */
+            log_printf(L"%s からの接続を断りました(版が合いません。相手 %d、こちら %d)", c->addr, p[4], PROTO_VER);
+            c->dead = TRUE;
+            return;
+        }
         CopyMemory(c->nM, p + 5, 16);
         if (!memcmp(p, "IMSF", 4)) {                /* ファイルの接続。相棒の入力の接続を探す */
             int i;
@@ -842,6 +886,7 @@ static void on_handshake(Conn *c, const BYTE *p, int n)
             if (c->link < 0) { c->dead = TRUE; return; }    /* 相棒がいない */
         }
         read_name(p + nameAt, n - nameAt, c->name);
+        c->caps = read_caps(p + nameAt, n - nameAt);
         if (!c->name[0]) lstrcpynW(c->name, c->addr, HOST_MAX);
         crypto_random(c->nS, 16);
         crypto_hmac(g_key, "S", 1, c->nM, 16, c->nS, 16, proof);
@@ -878,6 +923,8 @@ static void on_message(Conn *c, const BYTE *p, int n)
         switch (type) {
         case M_FREAD: filecopy_request(c->id, c->link, p, n); break;
         case M_FDATA: filecopy_deliver(c->id, p, n); break;
+        case M_FREADMANY: filecopy_request_many(c->id, c->link, p, n); break;
+        case M_FDATAZ:    filecopy_deliver_z(c->id, p, n); break;
         case M_PING:  if (!c->out) conn_msg(c, M_PONG, NULL, 0); break;
         }
         return;
@@ -981,7 +1028,7 @@ static void conn_read(Conn *c)
         if (!buf_room(&c->in, 65536)) { c->dead = TRUE; return; }
         n = recv(c->s, (char *)c->in.p + c->in.len, c->in.cap - c->in.len, 0);
         if (n > 0) { c->in.len += n; c->lastRx = GetTickCount(); }
-        else if (n == 0) { c->dead = TRUE; break; }
+        else if (n == 0) { c->dead = TRUE; c->peerClosed = TRUE; break; }
         else { if (WSAGetLastError() != WSAEWOULDBLOCK) c->dead = TRUE; break; }
 
         while (!c->dead && c->in.len - c->in.off >= 4) {
@@ -1349,7 +1396,7 @@ static DWORD WINAPI net_thread(LPVOID arg)
             if (WSAEnumNetworkEvents(c->s, c->ev, &ne) == 0) {
                 if (ne.lNetworkEvents & FD_READ)  conn_read(c);
                 if (ne.lNetworkEvents & FD_WRITE) conn_flush(c);
-                if (ne.lNetworkEvents & FD_CLOSE) { conn_read(c); c->dead = TRUE; }
+                if (ne.lNetworkEvents & FD_CLOSE) { conn_read(c); c->dead = TRUE; c->peerClosed = TRUE; }
             }
         }
 

@@ -19,10 +19,28 @@
  *
  *  中身はファイル用の 2 本目の接続で運ぶ(net.c)。入力の接続を詰まらせないため。
  *  申し出は、送った相手の接続からの読み出しにしか応えない。
+ *
+ *  まとめ読みと圧縮(v13 から。iiv v8 と同じ仕組み)
+ *      エクスプローラーはファイルを 1 つずつ順に読むので、1 つ読むたびに頼んで待つと、
+ *      ファイル 1 つにつき 1 往復かかる。小さいファイル(PF_FILE_MAX 以下)は、最初の 1 つを
+ *      読みに来たときに、続く小さいファイルを M_FREADMANY でまとめて(1 束 PF_BATCH ほど、
+ *      PF_BATCHES 束・PF_AHEAD まで先に)頼み、届いた中身を手元に置いて、読みに来たら渡す。
+ *      中身は zlite(deflate の level 1)で圧縮して M_FDATAZ で返す。1 割以上縮まなければ圧縮しない。
+ *      圧縮は暗号化(crypto.c)の前にかける(暗号文は縮まない)。大きいファイルは今までどおり
+ *      512KB ずつ読むが、M_FREAD に FCF_DEFLATE を付けて圧縮して返してもらう。
+ *      受け取る 1 回の大きさは「クリップボードの上限 + 1MB」まで(net.c。上限の最小は 1MB)なので、
+ *      1 束の中身は PF_RAW_MAX(1.5MB)までにする(iiv は 4MB)。
+ *
+ *      M_FREAD      [u32 reqid][u64 申し出][u32 何番目][u64 位置][u32 長さ][u8 FCF_*]
+ *      M_FDATA      [u32 reqid][u32 status][中身]
+ *      M_FREADMANY  [u32 reqid][u64 申し出][u8 FCF_*][u32 数][u32 何番目 × 数]
+ *      M_FDATAZ     [u32 reqid][u32 status][u8 0 = そのまま、1 = deflate][u32 元の長さ][中身]
+ *                   M_FREADMANY の中身(展開後)は、頼んだ順に [u32 status][u32 長さ][中身]
  * ================================================================== */
 
 #define COBJMACROS
 #include "mouser.h"
+#include "zlite.h"
 #include <shlobj.h>
 #include <shlwapi.h>
 
@@ -32,6 +50,17 @@
 #define FC_WAIT_MS     30000
 #define OFFER_KEEP     4
 #define SLOT_MAX       128
+
+#define PF_FILE_MAX    (256 * 1024)     /* まとめ読みにするファイルの大きさの上限 */
+#define PF_BATCH       (1024 * 1024)    /* 1 束の目安 */
+#define PF_BATCH_N     1024             /* 1 束のファイルの数の上限 */
+#define PF_BATCHES     4                /* 先に頼んでおく束の数 */
+#define PF_AHEAD       (8 << 20)        /* 頼んだ分と手元に置いた分の合計の上限 */
+#define PF_RAW_MAX     (1536 * 1024)    /* 送る側: 1 束の中身の上限(超えた分は status で断る) */
+#define PF_MANY_MAX    4096             /* 送る側: 1 回に受け付けるファイルの数 */
+#define FCF_DEFLATE    1u               /* M_FREAD・M_FREADMANY の印: 圧縮して返してよい */
+#define Z_LEVEL        1
+#define Z_MIN          1024             /* これより短い中身は圧縮しない */
 
 enum { FE_DIR = 1 };
 
@@ -196,6 +225,9 @@ typedef struct Req {
     int     fileConn, mainConn;
     UINT32  reqid, index, len;
     UINT64  offer, offset;
+    BYTE    flags;          /* FCF_* */
+    UINT32  count;          /* M_FREADMANY: 何番目の数(0 = M_FREAD) */
+    UINT32  many[1];        /* M_FREADMANY: 何番目 × count */
 } Req;
 
 static SRWLOCK g_reqLock = SRWLOCK_INIT;
@@ -203,12 +235,113 @@ static Req    *g_reqHead, *g_reqTail;
 static HANDLE  g_reqEvent, g_srvThread;
 static INIT_ONCE g_srvOnce = INIT_ONCE_STATIC_INIT;
 static volatile LONG g_srvStop;
-static UINT64  g_served, g_servedReqs;
+static UINT64  g_served, g_servedReqs, g_servedWire, g_servedFiles;
+
+/* 申し出の index 番目のフルパス。別の相手への申し出・古い申し出・フォルダは status を返す */
+static DWORD offer_path(UINT64 offer, int mainConn, UINT32 index, WCHAR *path, int cch)
+{
+    DWORD status = ERROR_FILE_NOT_FOUND;        /* 古くなった申し出 */
+    int   i;
+    path[0] = 0;
+    AcquireSRWLockShared(&g_offerLock);
+    for (i = 0; i < OFFER_KEEP; i++) {
+        const Offer *o = &g_offers[i];
+        if (o->off && o->id == offer) {
+            if (o->mainConn != mainConn) status = ERROR_ACCESS_DENIED;      /* 別の相手への申し出 */
+            else if (index >= (UINT32)o->n || o->off[index] == (size_t)-1) status = ERROR_INVALID_PARAMETER;
+            else { lstrcpynW(path, o->pool + o->off[index], cch); status = 0; }
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_offerLock);
+    return status;
+}
+
+static HANDLE open_read(const WCHAR *path)
+{
+    return CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+}
+
+/* 返事を送る。圧縮してよく、1 割以上縮むなら M_FDATAZ(deflate)で。
+   まとめ読みの返事(many)はいつも M_FDATAZ、M_FREAD の返事は縮まなければ今までの M_FDATA で */
+static void send_reply(ZDWork *zw, int fileConn, UINT32 reqid, DWORD status, const BYTE *data, UINT32 len, BYTE flags, BOOL many)
+{
+    BYTE  *out = NULL;
+    size_t zl = 0;
+    if (zw && (flags & FCF_DEFLATE) && len >= Z_MIN) {
+        out = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 13 + zd_bound(len));
+        if (out) {
+            zl = zd_compress(zw, data, 0, len, out + 13, Z_LEVEL, 1);
+            if (zl >= (size_t)len - len / 10) zl = 0;
+        }
+    }
+    if (zl || many) {
+        if (!zl) {
+            if (out) HeapFree(GetProcessHeap(), 0, out);
+            out = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 13 + (size_t)len);
+            if (!out) return;
+            if (len) CopyMemory(out + 13, data, len);
+        }
+        put32p(out, reqid);
+        put32p(out + 4, status);
+        out[8] = zl ? 1 : 0;
+        put32p(out + 9, len);
+        g_servedWire += 13 + (zl ? zl : len);
+        net_send_owned(fileConn, M_FDATAZ, out, 13 + (int)(zl ? zl : len));      /* out は net が解放する */
+    } else {
+        if (out) HeapFree(GetProcessHeap(), 0, out);
+        out = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 8 + (size_t)len);
+        if (!out) return;
+        put32p(out, reqid);
+        put32p(out + 4, status);
+        if (len) CopyMemory(out + 8, data, len);
+        g_servedWire += 8 + len;
+        net_send_owned(fileConn, M_FDATA, out, 8 + (int)len);
+    }
+    g_served += len;
+    g_servedReqs++;
+}
+
+/* M_FREADMANY: 頼まれた小さいファイルを丸ごと読み、[status][長さ][中身] を並べて返す */
+static void serve_many(ZDWork *zw, const Req *r)
+{
+    Bb     b;
+    UINT32 i;
+    BYTE  *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, PF_FILE_MAX);
+    ZeroMemory(&b, sizeof(b));
+    for (i = 0; i < r->count && buf; i++) {
+        WCHAR  path[MAX_PATH * 2];
+        DWORD  status = offer_path(r->offer, r->mainConn, r->many[i], path, ARRAYSIZE(path)), got = 0;
+        if (!status && b.len >= PF_RAW_MAX) status = ERROR_MORE_DATA;           /* 残りは 1 つずつ読んでもらう */
+        if (!status) {
+            HANDLE f = open_read(path);
+            LARGE_INTEGER sz;
+            if (f == INVALID_HANDLE_VALUE) status = GetLastError();
+            else {
+                if (!GetFileSizeEx(f, &sz)) status = GetLastError();
+                else if (sz.QuadPart > PF_FILE_MAX) status = ERROR_FILE_TOO_LARGE;  /* 大きくなった: 1 つずつ */
+                else if (!ReadFile(f, buf, (DWORD)sz.QuadPart, &got, NULL)) status = GetLastError();
+                CloseHandle(f);
+            }
+            if (status) { got = 0; log_printf(L"ファイルを読めない %s (%lu)", path, status); }
+        }
+        bb_u32(&b, status);
+        bb_u32(&b, got);
+        if (got) bb_put(&b, buf, got);
+        if (!status) g_servedFiles++;
+    }
+    if (buf && !b.err) send_reply(zw, r->fileConn, r->reqid, 0, b.p, (UINT32)b.len, r->flags, TRUE);
+    else send_reply(NULL, r->fileConn, r->reqid, ERROR_NOT_ENOUGH_MEMORY, NULL, 0, 0, TRUE);
+    if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    if (b.p) HeapFree(GetProcessHeap(), 0, b.p);
+}
 
 static DWORD WINAPI server_thread(LPVOID arg)
 {
-    HANDLE f = INVALID_HANDLE_VALUE;
-    WCHAR  cached[MAX_PATH * 2] = L"";
+    HANDLE  f = INVALID_HANDLE_VALUE;
+    WCHAR   cached[MAX_PATH * 2] = L"";
+    ZDWork *zw = zd_work_new();
     (void)arg;
 
     while (!g_srvStop) {
@@ -216,64 +349,53 @@ static DWORD WINAPI server_thread(LPVOID arg)
         if (WaitForSingleObject(g_reqEvent, 5000) == WAIT_TIMEOUT) {
             if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); f = INVALID_HANDLE_VALUE; cached[0] = 0; }
             if (g_servedReqs) {
-                log_printf(L"ファイルの中身を送りました(%I64u 回、%I64u KB)", g_servedReqs, g_served / 1024);
-                g_servedReqs = g_served = 0;
+                log_printf(L"ファイルの中身を送りました(%I64u 回、%I64u KB、送った量 %I64u KB、まとめ読み %I64u 件)",
+                           g_servedReqs, g_served / 1024, g_servedWire / 1024, g_servedFiles);
+                g_servedReqs = g_served = g_servedWire = g_servedFiles = 0;
             }
             continue;
         }
         for (;;) {
             WCHAR  path[MAX_PATH * 2];
-            DWORD  status = 0, got = 0;
+            DWORD  status, got = 0;
             BYTE  *buf;
-            int    i;
             AcquireSRWLockExclusive(&g_reqLock);
             r = g_reqHead;
             if (r) { g_reqHead = r->next; if (!g_reqHead) g_reqTail = NULL; }
             ReleaseSRWLockExclusive(&g_reqLock);
             if (!r) break;
-
-            path[0] = 0;
-            AcquireSRWLockShared(&g_offerLock);
-            for (i = 0; i < OFFER_KEEP; i++) {
-                const Offer *o = &g_offers[i];
-                if (o->off && o->id == r->offer) {
-                    if (o->mainConn != r->mainConn) status = ERROR_ACCESS_DENIED;   /* 別の相手への申し出 */
-                    else if (r->index >= (UINT32)o->n || o->off[r->index] == (size_t)-1) status = ERROR_INVALID_PARAMETER;
-                    else lstrcpynW(path, o->pool + o->off[r->index], ARRAYSIZE(path));
-                    break;
-                }
+            if (r->count) {
+                serve_many(zw, r);
+                HeapFree(GetProcessHeap(), 0, r);
+                continue;
             }
-            ReleaseSRWLockShared(&g_offerLock);
-            if (i == OFFER_KEEP) status = ERROR_FILE_NOT_FOUND;     /* 古くなった申し出 */
 
+            status = offer_path(r->offer, r->mainConn, r->index, path, ARRAYSIZE(path));
             if (r->len > FC_CHUNK) r->len = FC_CHUNK;
-            buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 8 + (status ? 0 : r->len));
+            buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, status ? 1 : r->len);
             if (!buf) { HeapFree(GetProcessHeap(), 0, r); continue; }
             if (!status) {
                 if (lstrcmpiW(path, cached)) {
                     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-                    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                    NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                    f = open_read(path);
                     lstrcpynW(cached, f != INVALID_HANDLE_VALUE ? path : L"", ARRAYSIZE(cached));
                 }
                 if (f == INVALID_HANDLE_VALUE) status = GetLastError();
                 else {
                     LARGE_INTEGER li;
                     li.QuadPart = (LONGLONG)r->offset;
-                    if (!SetFilePointerEx(f, li, NULL, FILE_BEGIN) || !ReadFile(f, buf + 8, r->len, &got, NULL))
+                    if (!SetFilePointerEx(f, li, NULL, FILE_BEGIN) || !ReadFile(f, buf, r->len, &got, NULL))
                         status = GetLastError();
                 }
                 if (status) got = 0;
             }
-            put32p(buf, r->reqid);
-            put32p(buf + 4, status);
-            g_served += got;
-            g_servedReqs++;
-            net_send_owned(r->fileConn, M_FDATA, buf, 8 + (int)got);
+            send_reply(zw, r->fileConn, r->reqid, status, buf, got, r->flags, FALSE);
+            HeapFree(GetProcessHeap(), 0, buf);
             HeapFree(GetProcessHeap(), 0, r);
         }
     }
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    if (zw) zd_work_free(zw);
     return 0;
 }
 
@@ -285,7 +407,16 @@ static BOOL CALLBACK srv_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return g_srvThread != NULL;
 }
 
-/* net スレッドから: [u32 reqid][u64 申し出][u32 何番目][u64 位置][u32 長さ] */
+static void req_push(Req *r)
+{
+    AcquireSRWLockExclusive(&g_reqLock);
+    if (g_reqTail) g_reqTail->next = r; else g_reqHead = r;
+    g_reqTail = r;
+    ReleaseSRWLockExclusive(&g_reqLock);
+    SetEvent(g_reqEvent);
+}
+
+/* net スレッドから: [u32 reqid][u64 申し出][u32 何番目][u64 位置][u32 長さ]([u8 FCF_*]) */
 void filecopy_request(int fileConn, int mainConn, const BYTE *p, int n)
 {
     Req *r;
@@ -299,11 +430,28 @@ void filecopy_request(int fileConn, int mainConn, const BYTE *p, int n)
     r->index    = le32p(p + 12);
     r->offset   = le64(p + 16);
     r->len      = le32p(p + 24);
-    AcquireSRWLockExclusive(&g_reqLock);
-    if (g_reqTail) g_reqTail->next = r; else g_reqHead = r;
-    g_reqTail = r;
-    ReleaseSRWLockExclusive(&g_reqLock);
-    SetEvent(g_reqEvent);
+    r->flags    = n > 28 ? p[28] : 0;
+    req_push(r);
+}
+
+/* net スレッドから: [u32 reqid][u64 申し出][u8 FCF_*][u32 数][u32 何番目 × 数] */
+void filecopy_request_many(int fileConn, int mainConn, const BYTE *p, int n)
+{
+    Req   *r;
+    UINT32 cnt, i;
+    if (n < 17 || !InitOnceExecuteOnce(&g_srvOnce, srv_init, NULL, NULL)) return;
+    cnt = le32p(p + 13);
+    if (!cnt || cnt > PF_MANY_MAX || (UINT32)(n - 17) < cnt * 4) return;
+    r = (Req *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(Req) + cnt * sizeof(UINT32));
+    if (!r) return;
+    r->fileConn = fileConn;
+    r->mainConn = mainConn;
+    r->reqid    = le32p(p);
+    r->offer    = le64(p + 4);
+    r->flags    = p[12];
+    r->count    = cnt;
+    for (i = 0; i < cnt; i++) r->many[i] = le32p(p + 17 + i * 4);
+    req_push(r);
 }
 
 /* ------------------------------------------------------------------ */
@@ -320,6 +468,8 @@ typedef struct {
     BYTE   *data;
     UINT32  len;
     DWORD   status;
+    BYTE    codec;          /* 0 = そのまま、1 = deflate(rawLen に展開する) */
+    UINT32  rawLen;
 } Slot;
 
 static Slot    g_slots[SLOT_MAX];
@@ -348,6 +498,8 @@ static int slot_new(int conn, UINT32 *reqid)
         s->data   = NULL;
         s->len    = 0;
         s->status = 0;
+        s->codec  = 0;
+        s->rawLen = 0;
     } else i = -1;
     ReleaseSRWLockExclusive(&g_slotLock);
     return i;
@@ -361,23 +513,21 @@ static void slot_abandon(int i)
     ReleaseSRWLockExclusive(&g_slotLock);
 }
 
-/* net スレッドから: [u32 reqid][u32 status][中身] */
-void filecopy_deliver(int fileConn, const BYTE *p, int n)
+static void slot_fill(int fileConn, UINT32 reqid, DWORD status, BYTE codec, UINT32 rawLen, const BYTE *p, int n)
 {
-    UINT32 reqid;
-    int    i;
-    if (n < 8) return;
-    reqid = le32p(p);
+    int i;
     AcquireSRWLockExclusive(&g_slotLock);
     for (i = 0; i < SLOT_MAX; i++) {
         Slot *s = &g_slots[i];
         if (s->reqid != reqid || s->conn != fileConn || (s->state != SL_WAIT && s->state != SL_ABANDON)) continue;
         if (s->state == SL_ABANDON) { slot_release_locked(s); break; }
-        s->status = le32p(p + 4);
-        s->len    = (UINT32)(n - 8);
+        s->status = status;
+        s->codec  = codec;
+        s->rawLen = rawLen;
+        s->len    = (UINT32)n;
         if (s->len) {
             s->data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, s->len);
-            if (s->data) CopyMemory(s->data, p + 8, s->len);
+            if (s->data) CopyMemory(s->data, p, s->len);
             else { s->status = ERROR_NOT_ENOUGH_MEMORY; s->len = 0; }
         }
         s->state = SL_DONE;
@@ -385,6 +535,68 @@ void filecopy_deliver(int fileConn, const BYTE *p, int n)
         break;
     }
     ReleaseSRWLockExclusive(&g_slotLock);
+}
+
+/* net スレッドから: [u32 reqid][u32 status][中身] */
+void filecopy_deliver(int fileConn, const BYTE *p, int n)
+{
+    if (n < 8) return;
+    slot_fill(fileConn, le32p(p), le32p(p + 4), 0, (UINT32)(n - 8), p + 8, n - 8);
+}
+
+/* net スレッドから: [u32 reqid][u32 status][u8 方式][u32 元の長さ][中身]。展開は待っている側でする */
+void filecopy_deliver_z(int fileConn, const BYTE *p, int n)
+{
+    UINT32 raw;
+    BYTE   codec;
+    if (n < 13) return;
+    codec = p[8];
+    raw   = le32p(p + 9);
+    if (codec > 1 || raw > (64u << 20) || (!codec && raw != (UINT32)(n - 13)))
+        slot_fill(fileConn, le32p(p), ERROR_INVALID_DATA, 0, 0, NULL, 0);
+    else slot_fill(fileConn, le32p(p), le32p(p + 4), codec, raw, p + 13, n - 13);
+}
+
+/* 届いた中身を受け取る(展開はしない)。slot の data は呼び手のものになる。
+   g_slotLock を持って呼ぶ。失敗していれば status を返す */
+typedef struct { BYTE *data; UINT32 len, rawLen; BYTE codec; } Got;
+
+static DWORD slot_take_locked(Slot *s, Got *g)
+{
+    ZeroMemory(g, sizeof(*g));
+    if (s->status) return s->status;
+    g->data   = s->data;
+    g->len    = s->len;
+    g->codec  = s->codec;
+    g->rawLen = s->rawLen;
+    s->data   = NULL;
+    return 0;
+}
+
+/* 圧縮されていれば展開する(g_slotLock の外で。数 MB の展開で net スレッドを待たせない) */
+static DWORD got_unpack(Got *g, BYTE **data, UINT32 *len)
+{
+    *data = NULL;
+    *len  = 0;
+    if (g->codec == 1) {
+        BYTE     *out = g->rawLen ? (BYTE *)HeapAlloc(GetProcessHeap(), 0, g->rawLen) : NULL;
+        ZInflate *z   = zi_new();
+        int       r   = (out && z) ? zi_inflate(z, g->data, g->len, out, g->rawLen) : -3;
+        if (z) zi_free(z);
+        if (g->data) HeapFree(GetProcessHeap(), 0, g->data);
+        g->data = NULL;
+        if (r) {
+            if (out) HeapFree(GetProcessHeap(), 0, out);
+            return r == -3 ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_DATA;
+        }
+        *data = out;
+        *len  = g->rawLen;
+        return 0;
+    }
+    *data   = g->data;
+    *len    = g->len;
+    g->data = NULL;
+    return 0;
 }
 
 /* ファイル用の接続が切れた。待っているものはすべて失敗にする */
@@ -412,6 +624,15 @@ typedef struct {
     BOOL    dir;
 } FEntry;
 
+enum { PF_NONE, PF_ASKED, PF_HAVE, PF_GONE };     /* GONE = 渡した・断られた(1 つずつ読む) */
+
+typedef struct {
+    int     slot;
+    UINT32  reqid;
+    UINT32  n;
+    UINT32 *idx;            /* 頼んだ順の何番目 */
+} PfBatch;
+
 typedef struct {
     LONG    ref;
     UINT64  id;
@@ -419,14 +640,205 @@ typedef struct {
     int     n;
     FEntry *e;
     WCHAR  *pool;
+    /* まとめ読み(pf_*)。pf を持って触る */
+    CRITICAL_SECTION pf;
+    BYTE   *pfState;        /* PF_*(n 個。使い始めるときに作る) */
+    BYTE  **pfData;         /* PF_HAVE の中身 */
+    int     pfNext;         /* 次に頼むところ */
+    int     pfLow;          /* これより前は捨てた */
+    PfBatch pfB[PF_BATCHES];
+    int     pfNb;           /* 頼んでいる束(古い順) */
+    UINT64  pfAhead;        /* PF_ASKED と PF_HAVE の大きさの合計 */
+    UINT64  pfGot, pfFiles, pfBatches, pfMiss;
 } OfferIn;              /* 受け取った一覧(データ オブジェクトと各ストリームが参照する) */
+
+static void pf_drop_batch(OfferIn *o, int k)
+{
+    UINT32 i;
+    for (i = 0; i < o->pfB[k].n; i++) {
+        UINT32 x = o->pfB[k].idx[i];
+        if (o->pfState[x] == PF_ASKED) { o->pfState[x] = PF_GONE; o->pfAhead -= o->e[x].size; }
+    }
+    HeapFree(GetProcessHeap(), 0, o->pfB[k].idx);
+    o->pfNb--;
+    MoveMemory(&o->pfB[k], &o->pfB[k + 1], (o->pfNb - k) * sizeof(PfBatch));
+}
 
 static void offer_in_release(OfferIn *o)
 {
+    int i;
     if (InterlockedDecrement(&o->ref)) return;
+    if (o->pfBatches)
+        log_printf(L"まとめ読み: %I64u 束、%I64u 件、届いた量 %I64u KB(1 つずつ読んだもの %I64u 件)",
+                   o->pfBatches, o->pfFiles, o->pfGot / 1024, o->pfMiss);
+    while (o->pfNb) { slot_abandon(o->pfB[0].slot); pf_drop_batch(o, 0); }
+    if (o->pfData) {
+        for (i = 0; i < o->n; i++) if (o->pfData[i]) HeapFree(GetProcessHeap(), 0, o->pfData[i]);
+        HeapFree(GetProcessHeap(), 0, o->pfData);
+    }
+    if (o->pfState) HeapFree(GetProcessHeap(), 0, o->pfState);
+    DeleteCriticalSection(&o->pf);
     HeapFree(GetProcessHeap(), 0, o->e);
     HeapFree(GetProcessHeap(), 0, o->pool);
     HeapFree(GetProcessHeap(), 0, o);
+}
+
+static int file_conn_for(int mainConn)
+{
+    int fc = net_file_conn(mainConn), i;
+    if (fc >= 0) return fc;
+    if (mainConn < CONN_IN_BASE) net_file_open(mainConn);   /* こちらが操作する側なら張る */
+    for (i = 0; i < 100 && (fc = net_file_conn(mainConn)) < 0; i++) Sleep(50);
+    return fc;
+}
+
+static BOOL pf_small(const FEntry *e) { return !e->dir && e->size && e->size <= PF_FILE_MAX; }
+
+/* 続く小さいファイルを、束にして頼めるだけ頼む */
+static void pf_fill(OfferIn *o)
+{
+    int fc = file_conn_for(o->mainConn);
+    if (fc < 0 || !(net_file_caps(fc) & CAP_FBATCH)) return;
+    while (o->pfNb < PF_BATCHES && o->pfAhead < PF_AHEAD) {
+        UINT32 *idx = (UINT32 *)HeapAlloc(GetProcessHeap(), 0, PF_BATCH_N * sizeof(UINT32));
+        BYTE   *msg;
+        UINT32  cnt = 0, reqid, k;
+        UINT64  bytes = 0;
+        int     i, sl;
+        if (!idx) return;
+        for (i = o->pfNext; i < o->n && cnt < PF_BATCH_N && bytes < PF_BATCH; i++) {
+            if (!pf_small(&o->e[i]) || o->pfState[i] != PF_NONE) continue;
+            idx[cnt++] = (UINT32)i;
+            bytes += o->e[i].size;
+        }
+        o->pfNext = i;
+        if (!cnt || (sl = slot_new(fc, &reqid)) < 0) { HeapFree(GetProcessHeap(), 0, idx); return; }
+        msg = (BYTE *)HeapAlloc(GetProcessHeap(), 0, 17 + cnt * 4);
+        if (!msg) {
+            slot_abandon(sl);
+            HeapFree(GetProcessHeap(), 0, idx);
+            return;
+        }
+        put32p(msg, reqid);
+        put32p(msg + 4, (UINT32)o->id); put32p(msg + 8, (UINT32)(o->id >> 32));
+        msg[12] = FCF_DEFLATE;
+        put32p(msg + 13, cnt);
+        for (k = 0; k < cnt; k++) put32p(msg + 17 + k * 4, idx[k]);
+        net_send_owned(fc, M_FREADMANY, msg, 17 + (int)cnt * 4);      /* msg は net が解放する */
+        for (k = 0; k < cnt; k++) o->pfState[idx[k]] = PF_ASKED;
+        o->pfAhead += bytes;
+        o->pfB[o->pfNb].slot  = sl;
+        o->pfB[o->pfNb].reqid = reqid;
+        o->pfB[o->pfNb].n     = cnt;
+        o->pfB[o->pfNb].idx   = idx;
+        o->pfNb++;
+        o->pfBatches++;
+    }
+}
+
+/* いちばん古い束が届いた: 中身を手元に置く。[u32 status][u32 長さ][中身] が頼んだ順に並ぶ */
+static void pf_collect(OfferIn *o)
+{
+    PfBatch *b = &o->pfB[0];
+    Slot    *sl = &g_slots[b->slot];
+    BYTE    *data = NULL;
+    UINT32   len = 0, i, pos = 0;
+    DWORD    st;
+    Got      g;
+    AcquireSRWLockExclusive(&g_slotLock);
+    st = slot_take_locked(sl, &g);
+    slot_release_locked(sl);
+    ReleaseSRWLockExclusive(&g_slotLock);
+    if (!st) st = got_unpack(&g, &data, &len);
+    if (st) log_printf(L"まとめ読みを受け取れませんでした (%lu)。1 つずつ読みます", st);
+    else o->pfGot += len;
+    for (i = 0; !st && i < b->n; i++) {
+        UINT32 x = b->idx[i], fst, fl;
+        if (pos + 8 > len) break;
+        fst = le32p(data + pos);
+        fl  = le32p(data + pos + 4);
+        pos += 8;
+        if (fl > len - pos) break;
+        if (!fst && fl == o->e[x].size && (int)x >= o->pfLow && o->pfState[x] == PF_ASKED) {
+            o->pfData[x] = (BYTE *)HeapAlloc(GetProcessHeap(), 0, fl);
+            if (o->pfData[x]) {
+                CopyMemory(o->pfData[x], data + pos, fl);
+                o->pfState[x] = PF_HAVE;
+            }
+        }
+        pos += fl;
+    }
+    if (data) HeapFree(GetProcessHeap(), 0, data);
+    pf_drop_batch(o, 0);            /* 手元に置けなかったものは PF_GONE(1 つずつ読む) */
+}
+
+/* index 番目(小さいファイル)の中身をまとめ読みで得る。得られなければ FALSE(1 つずつ読む) */
+static BOOL pf_get(OfferIn *o, int index, BYTE **data, UINT32 *len)
+{
+    BOOL ok = FALSE;
+    int  i;
+    if (!pf_small(&o->e[index])) return FALSE;
+    EnterCriticalSection(&o->pf);
+    if (!o->pfState) {
+        o->pfState = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, o->n);
+        o->pfData  = (BYTE **)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, o->n * sizeof(BYTE *));
+        if (!o->pfState || !o->pfData) {
+            if (o->pfState) HeapFree(GetProcessHeap(), 0, o->pfState);
+            if (o->pfData) HeapFree(GetProcessHeap(), 0, o->pfData);
+            o->pfState = NULL;
+            o->pfData  = NULL;
+            LeaveCriticalSection(&o->pf);
+            return FALSE;
+        }
+    }
+    /* 飛ばされた分は捨てる(エクスプローラーは前から順に読む) */
+    for (i = o->pfLow; i < index; i++) {
+        if (o->pfState[i] != PF_HAVE) continue;
+        HeapFree(GetProcessHeap(), 0, o->pfData[i]);
+        o->pfData[i]  = NULL;
+        o->pfState[i] = PF_GONE;
+        o->pfAhead   -= o->e[i].size;
+    }
+    if (index > o->pfLow) o->pfLow = index;
+    for (;;) {
+        BYTE st = o->pfState[index];
+        if (st == PF_HAVE) {
+            *data = o->pfData[index];
+            *len  = (UINT32)o->e[index].size;
+            o->pfData[index]  = NULL;
+            o->pfState[index] = PF_GONE;
+            o->pfAhead -= o->e[index].size;
+            o->pfFiles++;
+            ok = TRUE;
+            pf_fill(o);
+            break;
+        }
+        if (st == PF_GONE) { o->pfMiss++; break; }
+        if (st == PF_NONE) {
+            o->pfNext = index;
+            pf_fill(o);
+            if (o->pfState[index] == PF_NONE) { o->pfState[index] = PF_GONE; continue; }
+        }
+        if (!o->pfNb) { o->pfState[index] = PF_GONE; continue; }      /* 起きないはず */
+        {
+            /* いちばん古い束を待つ(外で待ち、戻ったら同じ束か確かめる) */
+            int    sl = o->pfB[0].slot;
+            UINT32 rq = o->pfB[0].reqid;
+            DWORD  w;
+            LeaveCriticalSection(&o->pf);
+            w = WaitForSingleObject(g_slots[sl].ev, FC_WAIT_MS);
+            EnterCriticalSection(&o->pf);
+            if (!o->pfNb || o->pfB[0].reqid != rq) continue;               /* ほかのスレッドが受け取った */
+            if (w == WAIT_OBJECT_0) pf_collect(o);
+            else {
+                log_printf(L"まとめ読みの返事が来ません。1 つずつ読みます");
+                slot_abandon(sl);
+                pf_drop_batch(o, 0);
+            }
+        }
+    }
+    LeaveCriticalSection(&o->pf);
+    return ok;
 }
 
 typedef struct {
@@ -447,6 +859,7 @@ typedef struct {
     UINT64   curStart;
     UINT32   curLen;
     HRESULT  err;
+    BOOL     pfTried;       /* まとめ読みを試した */
 } VStream;
 
 #define VS(p) ((VStream *)(p))
@@ -457,18 +870,9 @@ static void vs_drop_pending(VStream *s)
     s->qh = 0;
 }
 
-static int file_conn_for(int mainConn)
-{
-    int fc = net_file_conn(mainConn), i;
-    if (fc >= 0) return fc;
-    if (mainConn < CONN_IN_BASE) net_file_open(mainConn);   /* こちらが操作する側なら張る */
-    for (i = 0; i < 100 && (fc = net_file_conn(mainConn)) < 0; i++) Sleep(50);
-    return fc;
-}
-
 static BOOL vs_request(VStream *s)
 {
-    BYTE   b[28];
+    BYTE   b[29];
     UINT32 reqid, len;
     int    fc, sl;
     if (s->qn >= FC_WINDOW || s->reqPos >= s->size) return FALSE;
@@ -482,6 +886,7 @@ static BOOL vs_request(VStream *s)
     put32p(b + 12, (UINT32)s->index);
     put32p(b + 16, (UINT32)s->reqPos); put32p(b + 20, (UINT32)(s->reqPos >> 32));
     put32p(b + 24, len);
+    b[28] = (net_file_caps(fc) & CAP_FBATCH) ? FCF_DEFLATE : 0;
     net_send(fc, M_FREAD, b, sizeof(b));
     s->q[(s->qh + s->qn) % FC_WINDOW].slot   = sl;
     s->q[(s->qh + s->qn) % FC_WINDOW].offset = s->reqPos;
@@ -521,6 +926,17 @@ static HRESULT STDMETHODCALLTYPE vs_Read(IStream *p, void *dst, ULONG cb, ULONG 
     VStream *s = VS(p);
     ULONG    total = 0;
 
+    /* 小さいファイルは、まとめ読みで手元に届いた中身を丸ごと使う */
+    if (!s->pfTried && !s->cur && !s->qn && s->pos < s->size) {
+        BYTE  *d;
+        UINT32 n;
+        s->pfTried = TRUE;
+        if (pf_get(s->o, s->index, &d, &n)) {
+            s->cur      = d;
+            s->curStart = 0;
+            s->curLen   = n;
+        }
+    }
     while (total < cb && s->pos < s->size) {
         if (s->cur && s->pos >= s->curStart && s->pos < s->curStart + s->curLen) {
             ULONG k = (ULONG)min((UINT64)(cb - total), s->curStart + s->curLen - s->pos);
@@ -539,23 +955,25 @@ static HRESULT STDMETHODCALLTYPE vs_Read(IStream *p, void *dst, ULONG cb, ULONG 
         {
             Pend  *h  = &s->q[s->qh];
             Slot  *sl = &g_slots[h->slot];
-            DWORD  w  = WaitForSingleObject(sl->ev, FC_WAIT_MS);
+            DWORD  w  = WaitForSingleObject(sl->ev, FC_WAIT_MS), st = 0;
+            BOOL   got = FALSE;
+            Got    g;
             AcquireSRWLockExclusive(&g_slotLock);
             if (w != WAIT_OBJECT_0 || sl->state != SL_DONE) {
                 if (sl->state == SL_WAIT) sl->state = SL_ABANDON;
                 s->err = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-            } else if (sl->status) {
-                s->err = HRESULT_FROM_WIN32(sl->status);
-                slot_release_locked(sl);
             } else {
-                s->cur      = sl->data;
-                s->curLen   = sl->len;
-                s->curStart = h->offset;
-                sl->data    = NULL;
+                st = slot_take_locked(sl, &g);
                 slot_release_locked(sl);
-                if (!s->curLen) s->err = STG_E_READFAULT;     /* 短くなった */
+                got = TRUE;
             }
             ReleaseSRWLockExclusive(&g_slotLock);
+            if (got) {
+                if (!st) st = got_unpack(&g, &s->cur, &s->curLen);
+                s->curStart = h->offset;
+                if (st) s->err = HRESULT_FROM_WIN32(st);
+                else if (!s->curLen) s->err = STG_E_READFAULT;     /* 短くなった */
+            }
             s->qh = (s->qh + 1) % FC_WINDOW;
             s->qn--;
             if (s->err) {
@@ -829,6 +1247,7 @@ static OfferIn *parse_offer(int mainConn, const BYTE *p, int n)
         q += nl * 2;
     }
     o->n = (int)cnt;
+    InitializeCriticalSection(&o->pf);
     return o;
 bad:
     if (o->e) HeapFree(GetProcessHeap(), 0, o->e);

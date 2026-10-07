@@ -38,7 +38,7 @@
 #include <shellapi.h>
 
 #define APP_NAME     L"input-mouser"
-#define APP_VERSION  L"v12"      /* リリースのタグ(vN)と同じ。表示はこのまま */
+#define APP_VERSION  L"v13"      /* リリースのタグ(vN)と同じ。表示はこのまま */
 
 #define DEFAULT_PORT 31860
 #define PEER_MAX     8          /* 登録できる相手の数 */
@@ -193,8 +193,14 @@ enum {
     M_RELEASE,      /* M→S  押したままのキー・ボタンをすべて離す */
     M_FILES,        /* 双方(入力の接続)  コピーしたファイルの一覧(filecopy.c の形式) */
     M_FREAD,        /* 双方(ファイルの接続)  中身をください */
-    M_FDATA         /* 双方(ファイルの接続)  中身 */
+    M_FDATA,        /* 双方(ファイルの接続)  中身 */
+    M_FREADMANY,    /* 双方(ファイルの接続)  小さいファイルの中身をまとめてください(v13。CAP_FBATCH) */
+    M_FDATAZ        /* 双方(ファイルの接続)  中身(圧縮していることがある。v13。CAP_FBATCH) */
 };
+
+/* 能力の印(握手で名前の後ろに u32 で送る。v13 から)。互換を保てる追加は版(PROTO_VER)を上げず、ここにビットを足す */
+#define CAP_FBATCH   0x00000001u    /* ファイルのまとめ読み(M_FREADMANY)と圧縮(M_FDATAZ)が分かる */
+#define CAP_ALL      CAP_FBATCH     /* この版が出す印 */
 #define IKF_UP       0x01
 #define IKF_EXT      0x02
 #define IKF_UNICODE  0x04    /* VK_PACKET。scan に文字 */
@@ -223,6 +229,7 @@ void net_discover(HWND notify);
 int  net_incoming_names(WCHAR *buf, int cch);  /* 今つながっているマスターの名前 */
 void net_reconnect_now(void);
 int  net_file_conn(int mainConn);              /* その入力の接続の相棒のファイルの接続。なければ -1 */
+UINT32 net_file_caps(int fileConn);            /* そのファイルの接続の相手の能力の印(CAP_*) */
 void net_file_open(int peer);                  /* 相手へファイルの接続を張る(まだなければ) */
 int  net_in_main_ids(int *ids, int max);       /* こちらへ来ているマスターの入力の接続 */
 
@@ -295,6 +302,8 @@ void clip_force_send(int conn);
 BOOL filecopy_make_offer(int mainConn, HDROP hd, BYTE **out, int *outLen);
 void filecopy_request(int fileConn, int mainConn, const BYTE *p, int n);   /* net スレッドから */
 void filecopy_deliver(int fileConn, const BYTE *p, int n);
+void filecopy_request_many(int fileConn, int mainConn, const BYTE *p, int n);
+void filecopy_deliver_z(int fileConn, const BYTE *p, int n);
 void filecopy_conn_closed(int fileConn);
 void filecopy_offer_received(int mainConn, const BYTE *p, int n);
 void filecopy_stop(void);
